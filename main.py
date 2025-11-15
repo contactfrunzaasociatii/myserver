@@ -6,7 +6,6 @@ import jwt
 import os
 from dotenv import load_dotenv
 from jinja2 import Environment, FileSystemLoader
-import paramiko
 import xml.etree.ElementTree as ET
 import requests
 import logging
@@ -112,10 +111,10 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     raise HTTPException(status_code=400, detail="Incorrect username or password")
 
 
-# ==================== SFTP UPLOAD ====================
+# ==================== FTP UPLOAD ====================
 def upload_to_cpanel(local_path: str, remote_filename: str):
     """
-    Upload file to cPanel via SFTP with improved error handling
+    Upload file to cPanel via FTP with improved error handling
 
     Args:
         local_path: Local file path to upload
@@ -127,79 +126,84 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
     Raises:
         ValueError: If upload fails
     """
-    transport = None
-    sftp = None
+    from ftplib import FTP, error_perm
+
+    ftp = None
 
     try:
-        logger.info(f"Attempting SFTP connection to {CPANEL_HOST}:{CPANEL_PORT}")
+        logger.info(f"Attempting FTP connection to {CPANEL_HOST}:{CPANEL_PORT}")
 
-        # Create SSH transport
-        transport = paramiko.Transport((CPANEL_HOST, CPANEL_PORT))
-        transport.set_keepalive(30)
+        # Create FTP connection
+        ftp = FTP()
+        ftp.connect(CPANEL_HOST, CPANEL_PORT, timeout=30)
 
-        # Set timeouts
-        transport.banner_timeout = 30
-        transport.auth_timeout = 30
+        # Login
+        logger.info(f"Logging in as user: {CPANEL_USER}")
+        ftp.login(CPANEL_USER, CPANEL_PASSWORD)
 
-        # Connect with credentials
-        logger.info(f"Connecting as user: {CPANEL_USER}")
-        transport.connect(
-            username=CPANEL_USER,
-            password=CPANEL_PASSWORD,
-            hostkey=None
-        )
+        logger.info(f"FTP connection successful. Current directory: {ftp.pwd()}")
 
-        # Open SFTP session
-        sftp = paramiko.SFTPClient.from_transport(transport)
-
-        # Ensure remote directory exists
-        remote_path = f"{UPLOAD_PATH}/{remote_filename}"
+        # Change to upload directory
         try:
-            sftp.stat(UPLOAD_PATH)
-        except FileNotFoundError:
-            logger.warning(f"Remote directory {UPLOAD_PATH} not found, attempting to create")
-            # Try to create directory (might fail if permissions are insufficient)
+            ftp.cwd(UPLOAD_PATH)
+            logger.info(f"Changed to directory: {UPLOAD_PATH}")
+        except error_perm as e:
+            logger.error(f"Cannot access directory {UPLOAD_PATH}: {e}")
+            # Try to create directory
             try:
-                sftp.mkdir(UPLOAD_PATH)
-            except Exception as e:
-                logger.error(f"Could not create directory {UPLOAD_PATH}: {e}")
+                # Navigate to parent and create
+                parts = UPLOAD_PATH.strip('/').split('/')
+                current = '/'
+                for part in parts:
+                    current = f"{current}{part}/"
+                    try:
+                        ftp.cwd(current)
+                    except:
+                        ftp.mkd(current)
+                        ftp.cwd(current)
+                logger.info(f"Created and changed to directory: {UPLOAD_PATH}")
+            except Exception as create_error:
+                logger.error(f"Could not create directory: {create_error}")
                 raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist and cannot be created")
 
-        # Upload file
+        # Upload file in binary mode
+        remote_path = f"{UPLOAD_PATH}/{remote_filename}".replace('//', '/')
         logger.info(f"Uploading {local_path} to {remote_path}")
-        sftp.put(local_path, remote_path)
+
+        with open(local_path, 'rb') as f:
+            ftp.storbinary(f'STOR {remote_filename}', f)
+
         logger.info(f"File uploaded successfully to {remote_path}")
 
         return remote_path
 
-    except paramiko.AuthenticationException as e:
-        logger.error(f"Authentication failed: {e}")
-        raise ValueError(f"SFTP authentication failed. Check username and password.")
-
-    except paramiko.SSHException as e:
-        logger.error(f"SSH connection error: {e}")
-        raise ValueError(f"SFTP connection failed: {str(e)}. Check host, port, and firewall settings.")
+    except error_perm as e:
+        logger.error(f"FTP permission error: {e}")
+        if "530" in str(e):
+            raise ValueError(f"FTP authentication failed. Check username and password.")
+        elif "550" in str(e):
+            raise ValueError(f"FTP permission denied. Check directory permissions.")
+        else:
+            raise ValueError(f"FTP error: {str(e)}")
 
     except FileNotFoundError as e:
         logger.error(f"File not found: {e}")
         raise ValueError(f"Local file not found: {local_path}")
 
     except Exception as e:
-        logger.error(f"Unexpected error during SFTP upload: {e}")
+        logger.error(f"Unexpected error during FTP upload: {e}")
         raise ValueError(f"Upload failed: {str(e)}")
 
     finally:
-        # Clean up connections
-        if sftp:
+        # Close FTP connection
+        if ftp:
             try:
-                sftp.close()
+                ftp.quit()
             except:
-                pass
-        if transport:
-            try:
-                transport.close()
-            except:
-                pass
+                try:
+                    ftp.close()
+                except:
+                    pass
 
 
 # ==================== SITEMAP ====================
