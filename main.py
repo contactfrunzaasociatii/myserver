@@ -30,7 +30,7 @@ CPANEL_HOST = os.getenv("CPANEL_HOST")
 CPANEL_PORT = int(os.getenv("CPANEL_PORT", 21))
 CPANEL_USER = os.getenv("CPANEL_USERNAME")
 CPANEL_PASSWORD = os.getenv("CPANEL_PASSWORD")
-UPLOAD_PATH = os.getenv("UPLOAD_PATH")
+UPLOAD_PATH = os.getenv("UPLOAD_PATH")  # ⚠️ Asigură-te că aceasta este calea către public_html, NU public_html/noutati
 SITE_URL = os.getenv("SITE_URL")
 
 # Admin / JWT
@@ -265,7 +265,7 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
 
     Args:
         local_path: Local file path to upload
-        remote_filename: Remote filename (without path)
+        remote_filename: Remote filename (poate include subdirectoare, ex: "noutati/art.html")
 
     Returns:
         str: Remote file path
@@ -290,35 +290,57 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
 
         logger.info(f"FTP connection successful. Current directory: {ftp.pwd()}")
 
-        # Change to upload directory
+        # Change to *base* upload directory
         try:
             ftp.cwd(UPLOAD_PATH)
-            logger.info(f"Changed to directory: {UPLOAD_PATH}")
+            logger.info(f"Changed to base directory: {UPLOAD_PATH}")
         except error_perm as e:
-            logger.error(f"Cannot access directory {UPLOAD_PATH}: {e}")
-            # Try to create directory
+            logger.error(f"Cannot access base directory {UPLOAD_PATH}: {e}")
+            raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist.")
+
+        # --- Verifică dacă remote_filename conține subdirectoare ---
+        remote_dir_parts = remote_filename.split('/')
+        if len(remote_dir_parts) > 1:
+            # Conține subdirectoare, ex: "noutati/articol.html"
+            filename_only = remote_dir_parts[-1]
+            subdir_path = "/".join(remote_dir_parts[:-1])
+
+            # Încearcă să navighezi sau să creezi subdirectorul
             try:
-                # Navigate to parent and create
-                parts = UPLOAD_PATH.strip('/').split('/')
-                current = '/'
-                for part in parts:
-                    current = f"{current}{part}/"
-                    try:
-                        ftp.cwd(current)
-                    except:
-                        ftp.mkd(current)
-                        ftp.cwd(current)
-                logger.info(f"Created and changed to directory: {UPLOAD_PATH}")
-            except Exception as create_error:
-                logger.error(f"Could not create directory: {create_error}")
-                raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist and cannot be created")
+                # Navighează în subdirector
+                ftp.cwd(subdir_path)
+                logger.info(f"Changed to subdirectory: {subdir_path}")
+            except error_perm:
+                # Creează directorul dacă nu există
+                logger.warning(f"Subdirectory {subdir_path} not found, attempting to create.")
+                try:
+                    # Trebuie să creăm fiecare parte
+                    current_subdir = ""
+                    for part in subdir_path.split('/'):
+                        if not part: continue
+                        current_subdir = f"{current_subdir}/{part}".strip("/")
+                        try:
+                            ftp.cwd(current_subdir)
+                        except error_perm:
+                            ftp.mkd(current_subdir)
+                            ftp.cwd(current_subdir)
+                    logger.info(f"Created and changed to subdirectory: {current_subdir}")
+                except Exception as create_error:
+                    logger.error(f"Could not create subdirectory {subdir_path}: {create_error}")
+                    raise ValueError(f"Could not create subdirectory {subdir_path}")
+
+            # Setează fișierul de încărcat la doar numele fișierului
+            remote_file_to_upload = filename_only
+        else:
+            # Nu conține subdirectoare, e la rădăcină (relativ la UPLOAD_PATH)
+            remote_file_to_upload = remote_filename
 
         # Upload file in binary mode
         remote_path = f"{UPLOAD_PATH}/{remote_filename}".replace('//', '/')
-        logger.info(f"Uploading {local_path} to {remote_path}")
+        logger.info(f"Uploading {local_path} as {remote_file_to_upload} in {ftp.pwd()}")
 
         with open(local_path, 'rb') as f:
-            ftp.storbinary(f'STOR {remote_filename}', f)
+            ftp.storbinary(f'STOR {remote_file_to_upload}', f)
 
         logger.info(f"File uploaded successfully to {remote_path}")
 
@@ -381,7 +403,7 @@ def get_service_account_credentials():
             "client_id": os.getenv("GOOGLE_CLIENT_ID"),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1",
             "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{client_email.replace('@', '%40')}",
             "universe_domain": "googleapis.com"
         }
@@ -525,25 +547,67 @@ def delete_url_from_index(url: str):
 
 # ==================== SITEMAP ====================
 def update_sitemap(new_url: str):
-    """Add new URL to sitemap.xml"""
+    """
+    Add new URL to sitemap.xml by downloading existing first
+    """
+
+    # 0. Înregistrează namespace-ul pentru a evita <ns0:url> la scriere
+    ET.register_namespace("", "http://www.sitemaps.org/schemas/sitemap/0.9")
+
     try:
+        # 1. Încearcă să descarci sitemap-ul existent de pe server
+        try:
+            download_from_cpanel("sitemap.xml", SITEMAP_FILE)
+            logger.info("Downloaded existing sitemap.xml from cPanel")
+        except Exception as e:
+            logger.warning(f"Could not download sitemap.xml (may not exist yet): {e}")
+
+        # 2. Parsează fișierul local (fie descărcat, fie gol)
+        namespace = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         if os.path.exists(SITEMAP_FILE):
-            tree = ET.parse(SITEMAP_FILE)
-            root = tree.getroot()
+            try:
+                tree = ET.parse(SITEMAP_FILE)
+                root = tree.getroot()
+                # Verifică dacă e un sitemap valid
+                if root.tag != "{http://www.sitemaps.org/schemas/sitemap/0.9}urlset":
+                    logger.warning("Invalid sitemap root tag, creating new.")
+                    raise ET.ParseError
+            except ET.ParseError:
+                logger.warning("Corrupted sitemap.xml, creating new.")
+                root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
         else:
+            logger.info("No local sitemap.xml, creating new.")
             root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
 
-        url_elem = ET.Element("url")
-        ET.SubElement(url_elem, "loc").text = new_url
-        ET.SubElement(url_elem, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
-        ET.SubElement(url_elem, "changefreq").text = "weekly"
-        ET.SubElement(url_elem, "priority").text = "0.8"
+        # 3. Verifică dacă URL-ul există deja
+        found = False
+        for url_node in root.findall('sm:url', namespace):
+            loc = url_node.find('sm:loc', namespace)
+            if loc is not None and loc.text == new_url:
+                logger.info(f"URL {new_url} already in sitemap, updating lastmod.")
+                # Actualizează lastmod
+                lastmod = url_node.find('sm:lastmod', namespace)
+                if lastmod is not None:
+                    lastmod.text = datetime.utcnow().strftime("%Y-%m-%d")
+                else:
+                    ET.SubElement(url_node, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
+                found = True
+                break
 
-        root.append(url_elem)
+        # 4. Dacă URL-ul este nou, adaugă-l
+        if not found:
+            url_elem = ET.Element("url")
+            ET.SubElement(url_elem, "loc").text = new_url
+            ET.SubElement(url_elem, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
+            ET.SubElement(url_elem, "changefreq").text = "weekly"
+            ET.SubElement(url_elem, "priority").text = "0.8"
+
+            root.append(url_elem)
+            logger.info(f"Sitemap updated with new URL: {new_url}")
+
+        # 5. Scrie fișierul local
         tree = ET.ElementTree(root)
         tree.write(SITEMAP_FILE, encoding="utf-8", xml_declaration=True)
-
-        logger.info(f"Sitemap updated with new URL: {new_url}")
 
     except Exception as e:
         logger.error(f"Error updating sitemap: {e}")
@@ -668,7 +732,8 @@ async def create_article(
 
         # Upload to cPanel
         try:
-            upload_to_cpanel(local_path, filename)
+            # 💡 MODIFICAT: Adaugă "noutati/" la calea de upload
+            upload_to_cpanel(local_path, f"noutati/{filename}")
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
             raise HTTPException(
@@ -708,6 +773,7 @@ async def create_article(
         sitemap_updated = False
         try:
             update_sitemap(file_url)
+            # 💡 MODIFICAT: Se încarcă în rădăcină (presupunând UPLOAD_PATH e corect)
             upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
             logger.info("✅ Sitemap updated and uploaded")
 
@@ -736,7 +802,7 @@ async def create_article(
             "url": file_url,
             "article": metadata,
             "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "indexing_requested": indexing_requested
         }
 
     except HTTPException:
@@ -921,7 +987,7 @@ async def health_check():
             "site_url": SITE_URL,
             "upload_path_configured": bool(UPLOAD_PATH),
             "articles_count": len(articles),
-            "google_indexing_configured": google_configured  # 🆕
+            "google_indexing_configured": google_configured
         }
     }
 
@@ -981,7 +1047,8 @@ async def create_article_json(
 
         # Upload HTML to server
         try:
-            upload_to_cpanel(local_path, filename)
+            # 💡 MODIFICAT: Adaugă "noutati/" la calea de upload
+            upload_to_cpanel(local_path, f"noutati/{filename}")
             logger.info(f"Article HTML uploaded to server: {filename}")
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
@@ -1019,6 +1086,7 @@ async def create_article_json(
         sitemap_updated = False
         try:
             update_sitemap(file_url)
+            # 💡 MODIFICAT: Se încarcă în rădăcină (presupunând UPLOAD_PATH e corect)
             upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
             logger.info("✅ Sitemap updated and uploaded")
 
@@ -1050,7 +1118,7 @@ async def create_article_json(
             "url": file_url,
             "article": metadata,
             "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "indexing_requested": indexing_requested
         }
 
     except HTTPException:
