@@ -10,13 +10,12 @@ from jinja2 import Environment, FileSystemLoader
 import xml.etree.ElementTree as ET
 import requests
 import logging
-
-
-import json
+import urllib.parse
 import tempfile
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
 SCOPES = ["https://www.googleapis.com/auth/indexing"]
 
 # Setup logging
@@ -31,7 +30,7 @@ CPANEL_HOST = os.getenv("CPANEL_HOST")
 CPANEL_PORT = int(os.getenv("CPANEL_PORT", 21))
 CPANEL_USER = os.getenv("CPANEL_USERNAME")
 CPANEL_PASSWORD = os.getenv("CPANEL_PASSWORD")
-UPLOAD_PATH = os.getenv("UPLOAD_PATH")
+UPLOAD_PATH = os.getenv("UPLOAD_PATH")  # ⚠️ Asigură-te că aceasta este calea către public_html
 SITE_URL = os.getenv("SITE_URL")
 
 # Admin / JWT
@@ -80,8 +79,8 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚠️ Permite TOATE originile
-    allow_credentials=False,  # TREBUIE False cu "*"
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -117,14 +116,12 @@ def verify_jwt_token(token: str):
 def load_articles():
     """Load articles metadata from JSON file (download from cPanel if needed)"""
     try:
-        # Încearcă să descarci de pe cPanel mai întâi
         try:
             download_from_cpanel("articles.json", ARTICLES_JSON)
             logger.info("Downloaded articles.json from cPanel")
         except Exception as e:
             logger.warning(f"Could not download from cPanel: {e}")
 
-        # Citește local (fie descărcat, fie existent)
         if os.path.exists(ARTICLES_JSON):
             with open(ARTICLES_JSON, 'r', encoding='utf-8') as f:
                 articles = json.load(f)
@@ -149,10 +146,23 @@ def download_from_cpanel(remote_filename: str, local_path: str):
         ftp = FTP()
         ftp.connect(CPANEL_HOST, CPANEL_PORT, timeout=30)
         ftp.login(CPANEL_USER, CPANEL_PASSWORD)
+
+        # Navighează la directorul de bază
         ftp.cwd(UPLOAD_PATH)
 
+        # Verifică dacă remote_filename conține cale
+        remote_dir = os.path.dirname(remote_filename)
+        if remote_dir:
+            try:
+                ftp.cwd(remote_dir)
+                logger.info(f"Changed to subdirectory {remote_dir} for download")
+            except Exception:
+                logger.warning(f"Could not cwd to {remote_dir} for download, file might not exist.")
+                raise ValueError("File not found in subdirectory")
+
+        # Descarcă fișierul
         with open(local_path, 'wb') as f:
-            ftp.retrbinary(f'RETR {remote_filename}', f.write)
+            ftp.retrbinary(f'RETR {os.path.basename(remote_filename)}', f.write)
 
         logger.info(f"Downloaded {remote_filename} successfully")
 
@@ -169,27 +179,23 @@ def download_from_cpanel(remote_filename: str, local_path: str):
                 except:
                     pass
 
+
 def save_article_metadata(metadata: dict):
     """Save new article metadata to JSON file and upload to server"""
     try:
         articles = load_articles()
-
-        # Add new article at the beginning
         articles.insert(0, metadata)
 
-        # Save locally
         with open(ARTICLES_JSON, 'w', encoding='utf-8') as f:
             json.dump(articles, f, ensure_ascii=False, indent=2)
 
         logger.info(f"Article metadata saved locally: {metadata['title']}")
 
-        # Upload to server
         try:
             upload_to_cpanel(ARTICLES_JSON, "articles.json")
             logger.info("Articles JSON uploaded to server successfully")
         except Exception as e:
             logger.error(f"Failed to upload articles.json: {e}")
-            # Non-critical, continue
 
     except Exception as e:
         logger.error(f"Error saving article metadata: {e}")
@@ -201,17 +207,14 @@ def update_article_metadata(article_id: str, updates: dict):
     try:
         articles = load_articles()
 
-        # Find and update article
         for i, article in enumerate(articles):
             if str(article.get('id')) == str(article_id):
                 articles[i].update(updates)
                 articles[i]['updatedAt'] = datetime.utcnow().isoformat()
 
-                # Save locally
                 with open(ARTICLES_JSON, 'w', encoding='utf-8') as f:
                     json.dump(articles, f, ensure_ascii=False, indent=2)
 
-                # Upload to server
                 upload_to_cpanel(ARTICLES_JSON, "articles.json")
                 logger.info(f"Article updated: {article_id}")
                 return True
@@ -226,19 +229,15 @@ def delete_article_metadata(article_id: str):
     """Delete article metadata"""
     try:
         articles = load_articles()
-
-        # Filter out the article
         original_length = len(articles)
         articles = [a for a in articles if str(a.get('id')) != str(article_id)]
 
         if len(articles) == original_length:
-            return False  # Article not found
+            return False
 
-        # Save locally
         with open(ARTICLES_JSON, 'w', encoding='utf-8') as f:
             json.dump(articles, f, ensure_ascii=False, indent=2)
 
-        # Upload to server
         upload_to_cpanel(ARTICLES_JSON, "articles.json")
         logger.info(f"Article deleted: {article_id}")
         return True
@@ -265,117 +264,104 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
 
     Args:
         local_path: Local file path to upload
-        remote_filename: Remote filename (without path)
-
-    Returns:
-        str: Remote file path
-
-    Raises:
-        ValueError: If upload fails
+        remote_filename: Remote filename (poate include subdirectoare, ex: "noutati/art.html")
     """
     from ftplib import FTP, error_perm
 
     ftp = None
-
     try:
         logger.info(f"Attempting FTP connection to {CPANEL_HOST}:{CPANEL_PORT}")
-
-        # Create FTP connection
         ftp = FTP()
         ftp.connect(CPANEL_HOST, CPANEL_PORT, timeout=30)
-
-        # Login
         logger.info(f"Logging in as user: {CPANEL_USER}")
         ftp.login(CPANEL_USER, CPANEL_PASSWORD)
-
         logger.info(f"FTP connection successful. Current directory: {ftp.pwd()}")
 
-        # Change to upload directory
+        # Change to *base* upload directory
         try:
             ftp.cwd(UPLOAD_PATH)
-            logger.info(f"Changed to directory: {UPLOAD_PATH}")
+            logger.info(f"Changed to base directory: {UPLOAD_PATH}")
         except error_perm as e:
-            logger.error(f"Cannot access directory {UPLOAD_PATH}: {e}")
-            # Try to create directory
-            try:
-                # Navigate to parent and create
-                parts = UPLOAD_PATH.strip('/').split('/')
-                current = '/'
-                for part in parts:
-                    current = f"{current}{part}/"
-                    try:
-                        ftp.cwd(current)
-                    except:
-                        ftp.mkd(current)
-                        ftp.cwd(current)
-                logger.info(f"Created and changed to directory: {UPLOAD_PATH}")
-            except Exception as create_error:
-                logger.error(f"Could not create directory: {create_error}")
-                raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist and cannot be created")
+            logger.error(f"Cannot access base directory {UPLOAD_PATH}: {e}")
+            raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist.")
 
-        # Upload file in binary mode
+        # --- Verifică dacă remote_filename conține subdirectoare ---
+        remote_dir_parts = remote_filename.split('/')
+        if len(remote_dir_parts) > 1:
+            filename_only = remote_dir_parts[-1]
+            subdir_path = "/".join(remote_dir_parts[:-1])
+
+            try:
+                ftp.cwd(subdir_path)
+                logger.info(f"Changed to subdirectory: {subdir_path}")
+            except error_perm:
+                logger.warning(f"Subdirectory {subdir_path} not found, attempting to create.")
+                try:
+                    current_subdir = ""
+                    for part in subdir_path.split('/'):
+                        if not part: continue
+                        current_subdir = f"{current_subdir}/{part}".strip("/")
+                        try:
+                            ftp.cwd(current_subdir)
+                        except error_perm:
+                            ftp.mkd(current_subdir)
+                            ftp.cwd(current_subdir)
+                    logger.info(f"Created and changed to subdirectory: {current_subdir}")
+                except Exception as create_error:
+                    logger.error(f"Could not create subdirectory {subdir_path}: {create_error}")
+                    raise ValueError(f"Could not create subdirectory {subdir_path}")
+
+            remote_file_to_upload = filename_only
+        else:
+            remote_file_to_upload = remote_filename
+
         remote_path = f"{UPLOAD_PATH}/{remote_filename}".replace('//', '/')
-        logger.info(f"Uploading {local_path} to {remote_path}")
+        logger.info(f"Uploading {local_path} as {remote_file_to_upload} in {ftp.pwd()}")
 
         with open(local_path, 'rb') as f:
-            ftp.storbinary(f'STOR {remote_filename}', f)
+            ftp.storbinary(f'STOR {remote_file_to_upload}', f)
 
         logger.info(f"File uploaded successfully to {remote_path}")
-
         return remote_path
 
     except error_perm as e:
         logger.error(f"FTP permission error: {e}")
         if "530" in str(e):
-            raise ValueError(f"FTP authentication failed. Check username and password.")
+            raise ValueError("FTP authentication failed.")
         elif "550" in str(e):
-            raise ValueError(f"FTP permission denied. Check directory permissions.")
+            raise ValueError("FTP permission denied.")
         else:
             raise ValueError(f"FTP error: {str(e)}")
-
-    except FileNotFoundError as e:
-        logger.error(f"File not found: {e}")
+    except FileNotFoundError:
         raise ValueError(f"Local file not found: {local_path}")
-
     except Exception as e:
         logger.error(f"Unexpected error during FTP upload: {e}")
         raise ValueError(f"Upload failed: {str(e)}")
-
     finally:
-        # Close FTP connection
         if ftp:
             try:
                 ftp.quit()
             except:
-                try:
-                    ftp.close()
-                except:
-                    pass
+                pass
 
 
+# ==================== GOOGLE INDEXING API ====================
 def get_service_account_credentials():
-    """
-    Build Google service account credentials from environment variables
-
-    Returns:
-        google.oauth2.service_account.Credentials or None
-    """
+    """Build Google service account credentials from environment variables"""
     try:
-        # Check if all required variables are present
         project_id = os.getenv("GOOGLE_PROJECT_ID")
         private_key = os.getenv("GOOGLE_PRIVATE_KEY")
         client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
 
         if not all([project_id, private_key, client_email]):
-            logger.warning("Google service account credentials not configured in environment")
+            logger.warning("Google service account credentials not configured")
             return None
 
-        # Build credentials dictionary
         credentials_dict = {
             "type": "service_account",
             "project_id": project_id,
             "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
-            "private_key": private_key.replace('\\n', '\n'),  # Convert literal \n to actual newlines
+            "private_key": private_key.replace('\\n', '\n'),
             "client_email": client_email,
             "client_id": os.getenv("GOOGLE_CLIENT_ID"),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
@@ -385,59 +371,35 @@ def get_service_account_credentials():
             "universe_domain": "googleapis.com"
         }
 
-        # Create credentials from dict
         credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=SCOPES
+            credentials_dict, scopes=SCOPES
         )
-
-        logger.info("✅ Google service account credentials loaded from environment variables")
+        logger.info("✅ Google service account credentials loaded")
         return credentials
-
     except Exception as e:
         logger.error(f"❌ Error loading service account credentials: {e}")
         return None
 
 
 def request_google_indexing(url: str):
-    """
-    Request indexing for a URL using Google Indexing API
-
-    Args:
-        url: Full URL to index (e.g., https://frunza-asociatii.ro/noutati/article.html)
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
+    """Request indexing for a URL using Google Indexing API"""
     try:
-        # Get credentials
         credentials = get_service_account_credentials()
         if not credentials:
             logger.warning("⚠️ Google Indexing API not configured - skipping")
             return False
 
-        # Build the service
         service = build('indexing', 'v3', credentials=credentials)
-
-        # Request indexing
-        body = {
-            "url": url,
-            "type": "URL_UPDATED"
-        }
-
+        body = {"url": url, "type": "URL_UPDATED"}
         response = service.urlNotifications().publish(body=body).execute()
 
         logger.info(f"✅ Google indexing requested successfully for: {url}")
-        logger.debug(f"Google API response: {response}")
-
         return True
-
     except HttpError as e:
-        # Handle specific Google API errors
         if e.resp.status == 403:
-            logger.error(f"❌ Google API permission denied. Check service account permissions in Search Console")
+            logger.error("❌ Google API permission denied. Check Search Console permissions.")
         elif e.resp.status == 429:
-            logger.error(f"❌ Google API rate limit exceeded. Try again later")
+            logger.error("❌ Google API rate limit exceeded.")
         else:
             logger.error(f"❌ Google Indexing API HTTP error ({e.resp.status}): {e.content}")
         return False
@@ -446,108 +408,81 @@ def request_google_indexing(url: str):
         return False
 
 
-def request_google_batch_indexing(urls: list):
-    """
-    Request indexing for multiple URLs in a batch
-
-    Args:
-        urls: List of URLs to index
-
-    Returns:
-        dict: Results with success count and errors
-    """
-    try:
-        credentials = get_service_account_credentials()
-        if not credentials:
-            logger.warning("⚠️ Google Indexing API not configured - skipping batch")
-            return {"success": 0, "failed": len(urls), "errors": ["API not configured"]}
-
-        service = build('indexing', 'v3', credentials=credentials)
-        batch = service.new_batch_http_request()
-
-        results = {"success": 0, "failed": 0, "errors": []}
-
-        def callback(request_id, response, exception):
-            if exception:
-                results["failed"] += 1
-                results["errors"].append(str(exception))
-                logger.error(f"Batch indexing error for request {request_id}: {exception}")
-            else:
-                results["success"] += 1
-
-        for url in urls:
-            body = {"url": url, "type": "URL_UPDATED"}
-            batch.add(service.urlNotifications().publish(body=body), callback=callback)
-
-        batch.execute()
-
-        logger.info(f"✅ Batch indexing completed: {results['success']} succeeded, {results['failed']} failed")
-
-        return results
-
-    except Exception as e:
-        logger.error(f"❌ Batch indexing error: {e}")
-        return {"success": 0, "failed": len(urls), "errors": [str(e)]}
-
-
 def delete_url_from_index(url: str):
-    """
-    Request removal of a URL from Google index
-
-    Args:
-        url: Full URL to remove
-
-    Returns:
-        bool: True if successful, False otherwise
-    """
+    """Request removal of a URL from Google index"""
     try:
         credentials = get_service_account_credentials()
         if not credentials:
             return False
 
         service = build('indexing', 'v3', credentials=credentials)
-
-        body = {
-            "url": url,
-            "type": "URL_DELETED"
-        }
-
+        body = {"url": url, "type": "URL_DELETED"}
         response = service.urlNotifications().publish(body=body).execute()
 
         logger.info(f"✅ Google removal requested for: {url}")
         return True
-
     except Exception as e:
         logger.error(f"❌ Error requesting URL removal: {e}")
         return False
 
+
 # ==================== SITEMAP ====================
 def update_sitemap(new_url: str):
-    """Add new URL to sitemap.xml"""
+    """
+    Add new URL to sitemap.xml by downloading existing first
+    """
+    ET.register_namespace("", "http://www.sitemaps.org/schemas/sitemap/0.9")
+
     try:
+        try:
+            download_from_cpanel("sitemap.xml", SITEMAP_FILE)
+            logger.info("Downloaded existing sitemap.xml from cPanel")
+        except Exception as e:
+            logger.warning(f"Could not download sitemap.xml (may not exist yet): {e}")
+
+        namespace = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         if os.path.exists(SITEMAP_FILE):
-            tree = ET.parse(SITEMAP_FILE)
-            root = tree.getroot()
+            try:
+                tree = ET.parse(SITEMAP_FILE)
+                root = tree.getroot()
+                if root.tag != "{http://www.sitemaps.org/schemas/sitemap/0.9}urlset":
+                    raise ET.ParseError
+            except ET.ParseError:
+                logger.warning("Corrupted sitemap.xml, creating new.")
+                root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
         else:
+            logger.info("No local sitemap.xml, creating new.")
             root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
 
-        url_elem = ET.Element("url")
-        ET.SubElement(url_elem, "loc").text = new_url
-        ET.SubElement(url_elem, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
-        ET.SubElement(url_elem, "changefreq").text = "weekly"
-        ET.SubElement(url_elem, "priority").text = "0.8"
+        found = False
+        for url_node in root.findall('sm:url', namespace):
+            loc = url_node.find('sm:loc', namespace)
+            if loc is not None and loc.text == new_url:
+                logger.info(f"URL {new_url} already in sitemap, updating lastmod.")
+                lastmod = url_node.find('sm:lastmod', namespace)
+                if lastmod is not None:
+                    lastmod.text = datetime.utcnow().strftime("%Y-%m-%d")
+                else:
+                    ET.SubElement(url_node, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
+                found = True
+                break
 
-        root.append(url_elem)
+        if not found:
+            url_elem = ET.Element("url")
+            ET.SubElement(url_elem, "loc").text = new_url
+            ET.SubElement(url_elem, "lastmod").text = datetime.utcnow().strftime("%Y-%m-%d")
+            ET.SubElement(url_elem, "changefreq").text = "weekly"
+            ET.SubElement(url_elem, "priority").text = "0.8"
+            root.append(url_elem)
+            logger.info(f"Sitemap updated with new URL: {new_url}")
+
         tree = ET.ElementTree(root)
         tree.write(SITEMAP_FILE, encoding="utf-8", xml_declaration=True)
-
-        logger.info(f"Sitemap updated with new URL: {new_url}")
 
     except Exception as e:
         logger.error(f"Error updating sitemap: {e}")
         raise ValueError(f"Failed to update sitemap: {str(e)}")
 
-import urllib.parse
 
 def ping_google(sitemap_url: str):
     """Notify Google about sitemap update"""
@@ -557,7 +492,7 @@ def ping_google(sitemap_url: str):
             f"https://www.google.com/ping?sitemap={encoded_url}",
             timeout=10
         )
-        logger.info(f"Google pinged successfully. Status: {response.status_code}")
+        logger.info(f"Google pinged successfully for sitemap. Status: {response.status_code}")
     except Exception as e:
         logger.warning(f"Failed to ping Google (non-critical): {e}")
 
@@ -568,17 +503,10 @@ async def get_articles():
     """Get all articles metadata"""
     try:
         articles = load_articles()
-        return {
-            "status": "success",
-            "count": len(articles),
-            "articles": articles
-        }
+        return {"status": "success", "count": len(articles), "articles": articles}
     except Exception as e:
         logger.error(f"Error fetching articles: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to fetch articles"
-        )
+        raise HTTPException(status_code=500, detail="Failed to fetch articles")
 
 
 @app.get("/articles/{article_id}")
@@ -587,22 +515,14 @@ async def get_article(article_id: str):
     try:
         articles = load_articles()
         article = next((a for a in articles if str(a.get('id')) == article_id), None)
-
         if not article:
             raise HTTPException(status_code=404, detail="Article not found")
-
-        return {
-            "status": "success",
-            "article": article
-        }
+        return {"status": "success", "article": article}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error fetching article: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to fetch article"
-        )
+        raise HTTPException(status_code=500, detail="Failed to fetch article")
 
 
 def generate_tags_html(tags):
@@ -611,12 +531,7 @@ def generate_tags_html(tags):
         tags = [tag.strip() for tag in tags.split(",")]
     elif not isinstance(tags, list):
         tags = []
-
-    html_tags = []
-    for tag in tags:
-        if tag.strip():  # Skip empty tags
-            html_tags.append(f'<span class="tag">{tag.strip()}</span>')
-
+    html_tags = [f'<span class="tag">{tag.strip()}</span>' for tag in tags if tag.strip()]
     return "\n".join(html_tags) if html_tags else '<span class="tag">General</span>'
 
 
@@ -637,9 +552,9 @@ async def create_article(
 
     try:
         logger.info(f"Creating article: {title} (slug: {slug})")
-
-        # Render template
         template = env.get_template("article_template.html")
+        file_url = f"{SITE_URL}/noutati/{slug}.html"
+
         html_content = template.render(
             ARTICLE_TITLE=title,
             ARTICLE_CATEGORY=category,
@@ -652,68 +567,46 @@ async def create_article(
             ARTICLE_TAGS=tags,
             ARTICLE_TAGS_HTML=generate_tags_html(tags),
             ARTICLE_CONTENT=content,
-            ARTICLE_URL=f"{SITE_URL}/noutati/{slug}.html",
+            ARTICLE_URL=file_url,
             SITE_URL=SITE_URL
         )
 
-        # Generate filename
         filename = slug.lower().replace(" ", "-") + ".html"
         local_path = os.path.join(GENERATED_DIR, filename)
 
-        # Write local file
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         logger.info(f"Article file created locally: {local_path}")
 
-        # Upload to cPanel
         try:
-            upload_to_cpanel(local_path, filename)
+            # 💡 MODIFICAT: Adaugă "noutati/" la calea de upload
+            upload_to_cpanel(local_path, f"noutati/{filename}")
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload article to server: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to upload article to server: {str(e)}")
 
-        # Create article URL
-        file_url = f"{SITE_URL}/noutati/{filename}"
-
-        # Create metadata object
         article_id = int(datetime.utcnow().timestamp() * 1000)
         metadata = {
-            "id": article_id,
-            "title": title,
-            "slug": slug,
-            "category": category,
-            "tags": [tag.strip() for tag in tags.split(",")],
-            "excerpt": extras or "",
-            "coverImage": cover_image,
-            "content": content,
-            "status": "published",
-            "author": "Frunză & Asociații",
-            "createdAt": datetime.utcnow().isoformat(),
-            "updatedAt": datetime.utcnow().isoformat(),
-            "publishedAt": datetime.utcnow().isoformat(),
+            "id": article_id, "title": title, "slug": slug, "category": category,
+            "tags": [tag.strip() for tag in tags.split(",")], "excerpt": extras or "",
+            "coverImage": cover_image, "content": content, "status": "published",
+            "author": "Frunză & Asociații", "createdAt": datetime.utcnow().isoformat(),
+            "updatedAt": datetime.utcnow().isoformat(), "publishedAt": datetime.utcnow().isoformat(),
             "url": file_url
         }
 
-        # Save metadata
-        try:
-            save_article_metadata(metadata)
-        except Exception as e:
-            logger.warning(f"Failed to save article metadata (non-critical): {e}")
+        save_article_metadata(metadata)
 
-        # Update sitemap
         sitemap_updated = False
         try:
             update_sitemap(file_url)
             upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
             logger.info("✅ Sitemap updated and uploaded")
+            ping_google(f"{SITE_URL}/sitemap.xml")
             sitemap_updated = True
         except Exception as e:
-            logger.warning(f"Sitemap update failed (non-critical): {e}")
+            logger.warning(f"Sitemap update/ping failed (non-critical): {e}")
 
-        # 🆕 REQUEST INDEXING
         indexing_requested = False
         try:
             indexing_requested = request_google_indexing(file_url)
@@ -725,137 +618,85 @@ async def create_article(
         logger.info(f"✅ Article published successfully: {file_url}")
 
         return {
-            "status": "success",
-            "message": "Article created and published successfully",
-            "file": filename,
-            "url": file_url,
-            "article": metadata,
-            "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "status": "success", "message": "Article created and published successfully",
+            "file": filename, "url": file_url, "article": metadata,
+            "sitemap_updated": sitemap_updated, "indexing_requested": indexing_requested
         }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Unexpected error creating article: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to create article: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to create article: {str(e)}")
     finally:
         if local_path and os.path.exists(local_path):
             try:
                 os.remove(local_path)
-                logger.info(f"Local file cleaned up: {local_path}")
-            except Exception as e:
-                logger.warning(f"Failed to remove local file: {e}")
+            except:
+                pass
 
 
 @app.put("/articles/{article_id}")
 async def update_article(
         article_id: str,
-        title: str = Form(None),
-        category: str = Form(None),
-        tags: str = Form(None),
-        extras: str = Form(None),
-        cover_image: str = Form(None),
-        status: str = Form(None),
+        title: str = Form(None), category: str = Form(None),
+        tags: str = Form(None), extras: str = Form(None),
+        cover_image: str = Form(None), status: str = Form(None),
         token: str = Depends(oauth2_scheme)
 ):
     """Update existing article metadata"""
     verify_jwt_token(token)
-
     try:
         updates = {}
-        if title:
-            updates['title'] = title
-        if category:
-            updates['category'] = category
-        if tags:
-            updates['tags'] = [tag.strip() for tag in tags.split(",")]
-        if extras:
-            updates['excerpt'] = extras
-        if cover_image:
-            updates['coverImage'] = cover_image
+        if title: updates['title'] = title
+        if category: updates['category'] = category
+        if tags: updates['tags'] = [tag.strip() for tag in tags.split(",")]
+        if extras: updates['excerpt'] = extras
+        if cover_image: updates['coverImage'] = cover_image
         if status:
             updates['status'] = status
-            if status == 'published' and 'publishedAt' not in updates:
-                updates['publishedAt'] = datetime.utcnow().isoformat()
+            if status == 'published': updates['publishedAt'] = datetime.utcnow().isoformat()
 
-        success = update_article_metadata(article_id, updates)
-
-        if not success:
+        if not update_article_metadata(article_id, updates):
             raise HTTPException(status_code=404, detail="Article not found")
 
-        return {
-            "status": "success",
-            "message": "Article updated successfully",
-            "article_id": article_id
-        }
-
-    except HTTPException:
-        raise
+        return {"status": "success", "message": "Article updated successfully", "article_id": article_id}
     except Exception as e:
         logger.error(f"Error updating article: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to update article: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to update article: {str(e)}")
 
 
 @app.get("/test-google-indexing")
 async def test_google_indexing(token: str = Depends(oauth2_scheme)):
     """Test Google Indexing API configuration"""
     verify_jwt_token(token)
-
     try:
         credentials = get_service_account_credentials()
         if not credentials:
-            return {
-                "status": "error",
-                "message": "Google credentials not configured",
-                "configured": False
-            }
-
-        # Try to build service
-        service = build('indexing', 'v3', credentials=credentials)
-
+            return {"status": "error", "message": "Google credentials not configured", "configured": False}
+        build('indexing', 'v3', credentials=credentials)
         return {
-            "status": "success",
-            "message": "Google Indexing API configured correctly",
-            "configured": True,
-            "project_id": os.getenv("GOOGLE_PROJECT_ID"),
+            "status": "success", "message": "Google Indexing API configured correctly",
+            "configured": True, "project_id": os.getenv("GOOGLE_PROJECT_ID"),
             "client_email": os.getenv("GOOGLE_CLIENT_EMAIL")
         }
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Google API configuration error: {str(e)}",
-            "configured": False
-        }
+        return {"status": "error", "message": f"Google API configuration error: {str(e)}", "configured": False}
+
 
 @app.delete("/articles/{article_id}")
 async def delete_article(article_id: str, token: str = Depends(oauth2_scheme)):
     """Delete article metadata and request removal from index"""
     verify_jwt_token(token)
-
     try:
-        # Get article info before deletion
         articles = load_articles()
         article = next((a for a in articles if str(a.get('id')) == article_id), None)
-
         if not article:
             raise HTTPException(status_code=404, detail="Article not found")
 
         article_url = article.get('url')
-
-        # Delete from metadata
-        success = delete_article_metadata(article_id)
-
-        if not success:
+        if not delete_article_metadata(article_id):
             raise HTTPException(status_code=404, detail="Article not found")
 
-        # Request removal from Google index
         removal_requested = False
         if article_url:
             try:
@@ -865,57 +706,37 @@ async def delete_article(article_id: str, token: str = Depends(oauth2_scheme)):
             except Exception as e:
                 logger.warning(f"Could not request removal from index: {e}")
 
-        return {
-            "status": "success",
-            "message": "Article deleted successfully",
-            "article_id": article_id,
-            "removal_requested": removal_requested
-        }
-
-    except HTTPException:
-        raise
+        return {"status": "success", "message": "Article deleted successfully", "article_id": article_id,
+                "removal_requested": removal_requested}
     except Exception as e:
         logger.error(f"Error deleting article: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to delete article: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to delete article: {str(e)}")
 
 
 # ==================== HEALTH CHECK ====================
 @app.get("/")
 async def root():
     """Health check endpoint"""
-    return {
-        "status": "online",
-        "service": "Frunză & Asociații CMS API",
-        "version": "1.0.0"
-    }
+    return {"status": "online", "service": "Frunză & Asociații CMS API", "version": "1.0.0"}
 
 
 @app.get("/health")
 async def health_check():
     """Detailed health check"""
     articles = load_articles()
-
-    # Check Google API configuration
     google_configured = False
     try:
-        creds = get_service_account_credentials()
-        google_configured = creds is not None
+        google_configured = get_service_account_credentials() is not None
     except:
         pass
 
     return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "status": "healthy", "timestamp": datetime.utcnow().isoformat(),
         "config": {
-            "cpanel_host": CPANEL_HOST,
-            "cpanel_port": CPANEL_PORT,
-            "site_url": SITE_URL,
-            "upload_path_configured": bool(UPLOAD_PATH),
+            "cpanel_host": CPANEL_HOST, "cpanel_port": CPANEL_PORT,
+            "site_url": SITE_URL, "upload_path_configured": bool(UPLOAD_PATH),
             "articles_count": len(articles),
-            "google_indexing_configured": google_configured  # 🆕
+            "google_indexing_configured": google_configured
         }
     }
 
@@ -930,7 +751,6 @@ async def create_article_json(
     local_path = None
 
     try:
-        # Extract data from payload
         title = payload.get('title')
         slug = payload.get('slug')
         category = payload.get('category')
@@ -940,14 +760,14 @@ async def create_article_json(
         content = payload.get('content')
         status = payload.get('status', 'draft')
 
-        # Validate required fields
         if not all([title, slug, content, category]):
             raise HTTPException(status_code=400, detail="Missing required fields: title, slug, content, category")
 
         logger.info(f"Creating article via JSON: {title} (slug: {slug})")
 
-        # Render template
         template = env.get_template("article_template.html")
+        file_url = f"{SITE_URL}/noutati/{slug}.html"
+
         html_content = template.render(
             ARTICLE_TITLE=title,
             ARTICLE_CATEGORY=category,
@@ -960,66 +780,52 @@ async def create_article_json(
             ARTICLE_TAGS=", ".join(tags) if isinstance(tags, list) else tags,
             ARTICLE_TAGS_HTML=generate_tags_html(tags),
             ARTICLE_CONTENT=content,
-            ARTICLE_URL=f"{SITE_URL}/noutati/{slug}.html",
+            ARTICLE_URL=file_url,
             SITE_URL=SITE_URL
         )
 
-        # Generate filename
         filename = slug.lower().replace(" ", "-") + ".html"
         local_path = os.path.join(GENERATED_DIR, filename)
 
-        # Write local file
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
         logger.info(f"Article HTML created locally: {local_path}")
 
-        # Upload HTML to server
         try:
-            upload_to_cpanel(local_path, filename)
+            # 💡 MODIFICAT: Adaugă "noutati/" la calea de upload
+            upload_to_cpanel(local_path, f"noutati/{filename}")
             logger.info(f"Article HTML uploaded to server: {filename}")
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to upload article to server: {str(e)}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to upload article to server: {str(e)}")
 
-        # Create article URL
-        file_url = f"{SITE_URL}/noutati/{filename}"
-
-        # Create metadata
         article_id = int(datetime.utcnow().timestamp() * 1000)
         metadata = {
-            "id": article_id,
-            "title": title,
-            "slug": slug,
-            "category": category,
-            "tags": tags if isinstance(tags, list) else [tags],
-            "excerpt": excerpt,
-            "coverImage": cover_image,
-            "content": content,
-            "status": status,
-            "author": "Frunză & Asociații",
-            "createdAt": datetime.utcnow().isoformat(),
+            "id": article_id, "title": title, "slug": slug, "category": category,
+            "tags": tags if isinstance(tags, list) else [tags], "excerpt": excerpt,
+            "coverImage": cover_image, "content": content, "status": status,
+            "author": "Frunză & Asociații", "createdAt": datetime.utcnow().isoformat(),
             "updatedAt": datetime.utcnow().isoformat(),
             "publishedAt": datetime.utcnow().isoformat() if status == 'published' else None,
             "url": file_url
         }
 
-        # Save metadata
         save_article_metadata(metadata)
 
-        # Update sitemap
         sitemap_updated = False
         try:
             update_sitemap(file_url)
+            # 💡 MODIFICAT: Se încarcă în rădăcină
             upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
             logger.info("✅ Sitemap updated and uploaded")
+
+            # 🆕 PING GOOGLE SITEMAP
+            ping_google(f"{SITE_URL}/sitemap.xml")
+
             sitemap_updated = True
         except Exception as e:
-            logger.warning(f"Sitemap update failed (non-critical): {e}")
+            logger.warning(f"Sitemap update/ping failed (non-critical): {e}")
 
-        # 🆕 REQUEST INDEXING (doar dacă articolul e publicat)
         indexing_requested = False
         if status == 'published':
             try:
@@ -1034,15 +840,10 @@ async def create_article_json(
         logger.info(f"✅ Article published successfully: {file_url}")
 
         return {
-            "status": "success",
-            "message": "Article created and published successfully",
-            "file": filename,
-            "url": file_url,
-            "article": metadata,
-            "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "status": "success", "message": "Article created and published successfully",
+            "file": filename, "url": file_url, "article": metadata,
+            "sitemap_updated": sitemap_updated, "indexing_requested": indexing_requested
         }
-
     except HTTPException:
         raise
     except Exception as e:
@@ -1052,9 +853,8 @@ async def create_article_json(
         if local_path and os.path.exists(local_path):
             try:
                 os.remove(local_path)
-                logger.info(f"Local file cleaned up: {local_path}")
-            except Exception as e:
-                logger.warning(f"Failed to remove local file: {e}")
+            except:
+                pass
 
 
 # ==================== RUN UVICORN ====================
@@ -1062,14 +862,12 @@ if __name__ == "__main__":
     import uvicorn
 
     PORT = int(os.getenv("PORT", 8000))
-
     logger.info(f"Starting server on port {PORT}")
-    logger.info(f"CORS origins: {origins}")
     logger.info(f"cPanel host: {CPANEL_HOST}:{CPANEL_PORT}")
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=PORT,
-        reload=False  # Set to True only in development
+        reload=False
     )
