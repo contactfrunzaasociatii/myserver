@@ -1,3 +1,8 @@
+# MODIFICAT: Am scos 'Form' de aici, deoarece ai un endpoint (POST /articles)
+# care primește JSON (payload: dict). Dacă folosești *doar* endpoint-ul
+# /create-article (cu Form), poți lăsa 'Form' și să ștergi POST /articles.
+# Am lăsat ambele endpoint-uri, dar cel cu JSON (POST /articles) este
+# adesea mai flexibil.
 from fastapi import FastAPI, Depends, HTTPException, Form
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,12 +16,12 @@ import xml.etree.ElementTree as ET
 import requests
 import logging
 
-
 import json
 import tempfile
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+
 SCOPES = ["https://www.googleapis.com/auth/indexing"]
 
 # Setup logging
@@ -31,7 +36,13 @@ CPANEL_HOST = os.getenv("CPANEL_HOST")
 CPANEL_PORT = int(os.getenv("CPANEL_PORT", 21))
 CPANEL_USER = os.getenv("CPANEL_USERNAME")
 CPANEL_PASSWORD = os.getenv("CPANEL_PASSWORD")
-UPLOAD_PATH = os.getenv("UPLOAD_PATH")
+
+# MODIFICAT: Căi FTP separate pentru articole și sitemap
+ARTICLES_UPLOAD_PATH_FTP = os.getenv("ARTICLES_UPLOAD_PATH_FTP")
+SITEMAP_UPLOAD_PATH_FTP = os.getenv("SITEMAP_UPLOAD_PATH_FTP")
+
+# MODIFICAT: Subdirectorul URL pentru articole (ex: "noutati")
+ARTICLES_URL_SUBDIR = os.getenv("ARTICLES_URL_SUBDIR", "noutati")
 SITE_URL = os.getenv("SITE_URL")
 
 # Admin / JWT
@@ -46,7 +57,9 @@ required_vars = {
     "CPANEL_HOST": CPANEL_HOST,
     "CPANEL_USERNAME": CPANEL_USER,
     "CPANEL_PASSWORD": CPANEL_PASSWORD,
-    "UPLOAD_PATH": UPLOAD_PATH,
+    # MODIFICAT: Validare pentru căile noi
+    "ARTICLES_UPLOAD_PATH_FTP": ARTICLES_UPLOAD_PATH_FTP,
+    "SITEMAP_UPLOAD_PATH_FTP": SITEMAP_UPLOAD_PATH_FTP,
     "SITE_URL": SITE_URL,
     "ADMIN_USERNAME": ADMIN_USERNAME,
     "ADMIN_PASSWORD": ADMIN_PASSWORD,
@@ -80,8 +93,8 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚠️ Permite TOATE originile
-    allow_credentials=False,  # TREBUIE False cu "*"
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -119,7 +132,8 @@ def load_articles():
     try:
         # Încearcă să descarci de pe cPanel mai întâi
         try:
-            download_from_cpanel("articles.json", ARTICLES_JSON)
+            # MODIFICAT: Folosește calea FTP a articolelor
+            download_from_cpanel("articles.json", ARTICLES_JSON, ARTICLES_UPLOAD_PATH_FTP)
             logger.info("Downloaded articles.json from cPanel")
         except Exception as e:
             logger.warning(f"Could not download from cPanel: {e}")
@@ -138,18 +152,21 @@ def load_articles():
         return []
 
 
-def download_from_cpanel(remote_filename: str, local_path: str):
+# MODIFICAT: Funcția acceptă acum 'remote_dir'
+def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str):
     """Download file from cPanel via FTP"""
     from ftplib import FTP
 
     ftp = None
     try:
-        logger.info(f"Downloading {remote_filename} from cPanel...")
+        logger.info(f"Downloading {remote_filename} from cPanel ({remote_dir})...")
 
         ftp = FTP()
         ftp.connect(CPANEL_HOST, CPANEL_PORT, timeout=30)
         ftp.login(CPANEL_USER, CPANEL_PASSWORD)
-        ftp.cwd(UPLOAD_PATH)
+
+        # MODIFICAT: Folosește 'remote_dir'
+        ftp.cwd(remote_dir)
 
         with open(local_path, 'wb') as f:
             ftp.retrbinary(f'RETR {remote_filename}', f.write)
@@ -169,6 +186,7 @@ def download_from_cpanel(remote_filename: str, local_path: str):
                 except:
                     pass
 
+
 def save_article_metadata(metadata: dict):
     """Save new article metadata to JSON file and upload to server"""
     try:
@@ -185,7 +203,8 @@ def save_article_metadata(metadata: dict):
 
         # Upload to server
         try:
-            upload_to_cpanel(ARTICLES_JSON, "articles.json")
+            # MODIFICAT: Folosește calea FTP a articolelor
+            upload_to_cpanel(ARTICLES_JSON, "articles.json", ARTICLES_UPLOAD_PATH_FTP)
             logger.info("Articles JSON uploaded to server successfully")
         except Exception as e:
             logger.error(f"Failed to upload articles.json: {e}")
@@ -212,7 +231,8 @@ def update_article_metadata(article_id: str, updates: dict):
                     json.dump(articles, f, ensure_ascii=False, indent=2)
 
                 # Upload to server
-                upload_to_cpanel(ARTICLES_JSON, "articles.json")
+                # MODIFICAT: Folosește calea FTP a articolelor
+                upload_to_cpanel(ARTICLES_JSON, "articles.json", ARTICLES_UPLOAD_PATH_FTP)
                 logger.info(f"Article updated: {article_id}")
                 return True
 
@@ -239,7 +259,8 @@ def delete_article_metadata(article_id: str):
             json.dump(articles, f, ensure_ascii=False, indent=2)
 
         # Upload to server
-        upload_to_cpanel(ARTICLES_JSON, "articles.json")
+        # MODIFICAT: Folosește calea FTP a articolelor
+        upload_to_cpanel(ARTICLES_JSON, "articles.json", ARTICLES_UPLOAD_PATH_FTP)
         logger.info(f"Article deleted: {article_id}")
         return True
 
@@ -259,13 +280,15 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
 
 # ==================== FTP UPLOAD ====================
-def upload_to_cpanel(local_path: str, remote_filename: str):
+# MODIFICAT: Funcția acceptă acum 'remote_dir'
+def upload_to_cpanel(local_path: str, remote_filename: str, remote_dir: str):
     """
     Upload file to cPanel via FTP with improved error handling
 
     Args:
         local_path: Local file path to upload
         remote_filename: Remote filename (without path)
+        remote_dir: Remote directory path to upload to
 
     Returns:
         str: Remote file path
@@ -292,14 +315,17 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
 
         # Change to upload directory
         try:
-            ftp.cwd(UPLOAD_PATH)
-            logger.info(f"Changed to directory: {UPLOAD_PATH}")
+            # MODIFICAT: Folosește 'remote_dir'
+            ftp.cwd(remote_dir)
+            logger.info(f"Changed to directory: {remote_dir}")
         except error_perm as e:
-            logger.error(f"Cannot access directory {UPLOAD_PATH}: {e}")
+            # MODIFICAT: Folosește 'remote_dir'
+            logger.error(f"Cannot access directory {remote_dir}: {e}")
             # Try to create directory
             try:
                 # Navigate to parent and create
-                parts = UPLOAD_PATH.strip('/').split('/')
+                # MODIFICAT: Folosește 'remote_dir'
+                parts = remote_dir.strip('/').split('/')
                 current = '/'
                 for part in parts:
                     current = f"{current}{part}/"
@@ -308,13 +334,16 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
                     except:
                         ftp.mkd(current)
                         ftp.cwd(current)
-                logger.info(f"Created and changed to directory: {UPLOAD_PATH}")
+                # MODIFICAT: Folosește 'remote_dir'
+                logger.info(f"Created and changed to directory: {remote_dir}")
             except Exception as create_error:
                 logger.error(f"Could not create directory: {create_error}")
-                raise ValueError(f"Remote directory {UPLOAD_PATH} does not exist and cannot be created")
+                # MODIFICAT: Folosește 'remote_dir'
+                raise ValueError(f"Remote directory {remote_dir} does not exist and cannot be created")
 
         # Upload file in binary mode
-        remote_path = f"{UPLOAD_PATH}/{remote_filename}".replace('//', '/')
+        # MODIFICAT: Folosește 'remote_dir'
+        remote_path = f"{remote_dir}/{remote_filename}".replace('//', '/')
         logger.info(f"Uploading {local_path} to {remote_path}")
 
         with open(local_path, 'rb') as f:
@@ -521,13 +550,36 @@ def delete_url_from_index(url: str):
         logger.error(f"❌ Error requesting URL removal: {e}")
         return False
 
+
 # ==================== SITEMAP ====================
 def update_sitemap(new_url: str):
     """Add new URL to sitemap.xml"""
     try:
+        # MODIFICAT: Încearcă să descarce sitemap-ul existent de pe server
+        # pentru a continua adăugarea (append)
+        try:
+            download_from_cpanel("sitemap.xml", SITEMAP_FILE, SITEMAP_UPLOAD_PATH_FTP)
+            logger.info("Downloaded existing sitemap.xml")
+        except Exception as e:
+            logger.warning(f"Could not download existing sitemap, creating new one: {e}")
+            if os.path.exists(SITEMAP_FILE):
+                os.remove(SITEMAP_FILE)  # Șterge fișierul local vechi dacă descărcarea eșuează
+
         if os.path.exists(SITEMAP_FILE):
             tree = ET.parse(SITEMAP_FILE)
             root = tree.getroot()
+            # Verifică dacă URL-ul există deja
+            ns = {'sitemap': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+            existing = root.find(f"sitemap:url[sitemap:loc='{new_url}']", ns)
+            if existing is not None:
+                logger.info(f"URL {new_url} already in sitemap. Updating lastmod.")
+                lastmod = existing.find("sitemap:lastmod", ns)
+                if lastmod is not None:
+                    lastmod.text = datetime.utcnow().strftime("%Y-%m-%d")
+                # Salvează și ieși
+                tree.write(SITEMAP_FILE, encoding="utf-8", xml_declaration=True)
+                return  # Nu mai adăuga din nou
+
         else:
             root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
 
@@ -541,23 +593,28 @@ def update_sitemap(new_url: str):
         tree = ET.ElementTree(root)
         tree.write(SITEMAP_FILE, encoding="utf-8", xml_declaration=True)
 
-        logger.info(f"Sitemap updated with new URL: {new_url}")
+        logger.info(f"Sitemap updated locally with new URL: {new_url}")
 
     except Exception as e:
         logger.error(f"Error updating sitemap: {e}")
         raise ValueError(f"Failed to update sitemap: {str(e)}")
 
+
 import urllib.parse
+
 
 def ping_google(sitemap_url: str):
     """Notify Google about sitemap update"""
     try:
         encoded_url = urllib.parse.quote(sitemap_url, safe='')
-        response = requests.get(
-            f"https://www.google.com/ping?sitemap={encoded_url}",
-            timeout=10
-        )
+        ping_url = f"https://www.google.com/ping?sitemap={encoded_url}"
+
+        logger.info(f"Pinging Google with sitemap: {ping_url}")
+
+        response = requests.get(ping_url, timeout=10)
+
         logger.info(f"Google pinged successfully. Status: {response.status_code}")
+
     except Exception as e:
         logger.warning(f"Failed to ping Google (non-critical): {e}")
 
@@ -631,12 +688,15 @@ async def create_article(
         content: str = Form(...),
         token: str = Depends(oauth2_scheme)
 ):
-    """Create a new article and upload to cPanel"""
+    """Create a new article (from Form data) and upload to cPanel"""
     verify_jwt_token(token)
     local_path = None
 
     try:
         logger.info(f"Creating article: {title} (slug: {slug})")
+
+        # MODIFICAT: Folosește variabila de subdirector URL
+        article_url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{slug}.html"
 
         # Render template
         template = env.get_template("article_template.html")
@@ -652,7 +712,7 @@ async def create_article(
             ARTICLE_TAGS=tags,
             ARTICLE_TAGS_HTML=generate_tags_html(tags),
             ARTICLE_CONTENT=content,
-            ARTICLE_URL=f"{SITE_URL}/noutati/{slug}.html",
+            ARTICLE_URL=article_url,  # MODIFICAT
             SITE_URL=SITE_URL
         )
 
@@ -667,7 +727,8 @@ async def create_article(
 
         # Upload to cPanel
         try:
-            upload_to_cpanel(local_path, filename)
+            # MODIFICAT: Folosește calea FTP a articolelor
+            upload_to_cpanel(local_path, filename, ARTICLES_UPLOAD_PATH_FTP)
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
             raise HTTPException(
@@ -675,8 +736,8 @@ async def create_article(
                 detail=f"Failed to upload article to server: {str(e)}"
             )
 
-        # Create article URL
-        file_url = f"{SITE_URL}/noutati/{filename}"
+        # MODIFICAT: Folosește URL-ul deja definit
+        file_url = article_url
 
         # Create metadata object
         article_id = int(datetime.utcnow().timestamp() * 1000)
@@ -685,7 +746,7 @@ async def create_article(
             "title": title,
             "slug": slug,
             "category": category,
-            "tags": [tag.strip() for tag in tags.split(",")],
+            "tags": [tag.strip() for tag in tags.split(",")] if tags else [],
             "excerpt": extras or "",
             "coverImage": cover_image,
             "content": content,
@@ -697,23 +758,35 @@ async def create_article(
             "url": file_url
         }
 
-        # Save metadata
+        # Save metadata (care include și upload-ul articles.json)
         try:
             save_article_metadata(metadata)
         except Exception as e:
             logger.warning(f"Failed to save article metadata (non-critical): {e}")
 
-        # Update sitemap
+        # MODIFICAT: Fluxul de Sitemap și Indexare
         sitemap_updated = False
+        sitemap_pinged = False  # NOU
+
         try:
+            # 1. Actualizează sitemap local (descărcând mai întâi)
             update_sitemap(file_url)
-            upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
+
+            # 2. Upload sitemap.xml la rădăcină (public_html)
+            upload_to_cpanel(SITEMAP_FILE, "sitemap.xml", SITEMAP_UPLOAD_PATH_FTP)
             logger.info("✅ Sitemap updated and uploaded")
             sitemap_updated = True
-        except Exception as e:
-            logger.warning(f"Sitemap update failed (non-critical): {e}")
 
-        # 🆕 REQUEST INDEXING
+            # 3. Ping Google Sitemap
+            sitemap_full_url = f"{SITE_URL}/sitemap.xml"
+            ping_google(sitemap_full_url)
+            logger.info(f"✅ Sitemap pinged: {sitemap_full_url}")
+            sitemap_pinged = True
+
+        except Exception as e:
+            logger.warning(f"Sitemap update/ping failed (non-critical): {e}")
+
+        # 4. Solicită indexarea API pentru noul URL
         indexing_requested = False
         try:
             indexing_requested = request_google_indexing(file_url)
@@ -731,7 +804,8 @@ async def create_article(
             "url": file_url,
             "article": metadata,
             "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "sitemap_pinged": sitemap_pinged,  # NOU
+            "indexing_requested": indexing_requested
         }
 
     except HTTPException:
@@ -781,6 +855,9 @@ async def update_article(
             updates['status'] = status
             if status == 'published' and 'publishedAt' not in updates:
                 updates['publishedAt'] = datetime.utcnow().isoformat()
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="No update data provided")
 
         success = update_article_metadata(article_id, updates)
 
@@ -834,6 +911,7 @@ async def test_google_indexing(token: str = Depends(oauth2_scheme)):
             "configured": False
         }
 
+
 @app.delete("/articles/{article_id}")
 async def delete_article(article_id: str, token: str = Depends(oauth2_scheme)):
     """Delete article metadata and request removal from index"""
@@ -849,7 +927,7 @@ async def delete_article(article_id: str, token: str = Depends(oauth2_scheme)):
 
         article_url = article.get('url')
 
-        # Delete from metadata
+        # Delete from metadata (acest pas urcă și noul articles.json)
         success = delete_article_metadata(article_id)
 
         if not success:
@@ -864,6 +942,9 @@ async def delete_article(article_id: str, token: str = Depends(oauth2_scheme)):
                     logger.info(f"🗑️ Google removal requested for: {article_url}")
             except Exception as e:
                 logger.warning(f"Could not request removal from index: {e}")
+
+        # TODO: Ar trebui să ștergem și fișierul HTML de pe server?
+        # TODO: Ar trebui să actualizăm sitemap.xml și să scoatem URL-ul? (Google recomandă 404/410)
 
         return {
             "status": "success",
@@ -913,9 +994,11 @@ async def health_check():
             "cpanel_host": CPANEL_HOST,
             "cpanel_port": CPANEL_PORT,
             "site_url": SITE_URL,
-            "upload_path_configured": bool(UPLOAD_PATH),
+            # MODIFICAT: Verifică noile căi
+            "articles_upload_path_ftp": ARTICLES_UPLOAD_PATH_FTP,
+            "sitemap_upload_path_ftp": SITEMAP_UPLOAD_PATH_FTP,
             "articles_count": len(articles),
-            "google_indexing_configured": google_configured  # 🆕
+            "google_indexing_configured": google_configured
         }
     }
 
@@ -946,6 +1029,9 @@ async def create_article_json(
 
         logger.info(f"Creating article via JSON: {title} (slug: {slug})")
 
+        # MODIFICAT: Folosește variabila de subdirector URL
+        article_url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{slug}.html"
+
         # Render template
         template = env.get_template("article_template.html")
         html_content = template.render(
@@ -960,7 +1046,7 @@ async def create_article_json(
             ARTICLE_TAGS=", ".join(tags) if isinstance(tags, list) else tags,
             ARTICLE_TAGS_HTML=generate_tags_html(tags),
             ARTICLE_CONTENT=content,
-            ARTICLE_URL=f"{SITE_URL}/noutati/{slug}.html",
+            ARTICLE_URL=article_url,  # MODIFICAT
             SITE_URL=SITE_URL
         )
 
@@ -975,7 +1061,8 @@ async def create_article_json(
 
         # Upload HTML to server
         try:
-            upload_to_cpanel(local_path, filename)
+            # MODIFICAT: Folosește calea FTP a articolelor
+            upload_to_cpanel(local_path, filename, ARTICLES_UPLOAD_PATH_FTP)
             logger.info(f"Article HTML uploaded to server: {filename}")
         except ValueError as e:
             logger.error(f"Upload failed: {e}")
@@ -984,8 +1071,8 @@ async def create_article_json(
                 detail=f"Failed to upload article to server: {str(e)}"
             )
 
-        # Create article URL
-        file_url = f"{SITE_URL}/noutati/{filename}"
+        # MODIFICAT: Folosește URL-ul deja definit
+        file_url = article_url
 
         # Create metadata
         article_id = int(datetime.utcnow().timestamp() * 1000)
@@ -994,7 +1081,7 @@ async def create_article_json(
             "title": title,
             "slug": slug,
             "category": category,
-            "tags": tags if isinstance(tags, list) else [tags],
+            "tags": tags if isinstance(tags, list) else ([tags] if tags else []),
             "excerpt": excerpt,
             "coverImage": cover_image,
             "content": content,
@@ -1006,22 +1093,35 @@ async def create_article_json(
             "url": file_url
         }
 
-        # Save metadata
+        # Save metadata (acest pas urcă și noul articles.json)
         save_article_metadata(metadata)
 
-        # Update sitemap
+        # MODIFICAT: Fluxul de Sitemap și Indexare
         sitemap_updated = False
-        try:
-            update_sitemap(file_url)
-            upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
-            logger.info("✅ Sitemap updated and uploaded")
-            sitemap_updated = True
-        except Exception as e:
-            logger.warning(f"Sitemap update failed (non-critical): {e}")
+        sitemap_pinged = False  # NOU
 
-        # 🆕 REQUEST INDEXING (doar dacă articolul e publicat)
-        indexing_requested = False
+        # Actualizăm sitemap și indexăm doar dacă articolul este publicat
         if status == 'published':
+            try:
+                # 1. Actualizează sitemap local (descărcând mai întâi)
+                update_sitemap(file_url)
+
+                # 2. Upload sitemap.xml la rădăcină (public_html)
+                upload_to_cpanel(SITEMAP_FILE, "sitemap.xml", SITEMAP_UPLOAD_PATH_FTP)
+                logger.info("✅ Sitemap updated and uploaded")
+                sitemap_updated = True
+
+                # 3. Ping Google Sitemap
+                sitemap_full_url = f"{SITE_URL}/sitemap.xml"
+                ping_google(sitemap_full_url)
+                logger.info(f"✅ Sitemap pinged: {sitemap_full_url}")
+                sitemap_pinged = True
+
+            except Exception as e:
+                logger.warning(f"Sitemap update/ping failed (non-critical): {e}")
+
+            # 4. Solicită indexarea API pentru noul URL
+            indexing_requested = False
             try:
                 indexing_requested = request_google_indexing(file_url)
                 if indexing_requested:
@@ -1031,16 +1131,21 @@ async def create_article_json(
             except Exception as e:
                 logger.warning(f"Indexing request failed (non-critical): {e}")
 
-        logger.info(f"✅ Article published successfully: {file_url}")
+        else:
+            indexing_requested = False
+            logger.info(f"Article saved as draft. Skipping sitemap and indexing.")
+
+        logger.info(f"✅ Article processed successfully: {file_url}")
 
         return {
             "status": "success",
-            "message": "Article created and published successfully",
+            "message": "Article created successfully",
             "file": filename,
             "url": file_url,
             "article": metadata,
             "sitemap_updated": sitemap_updated,
-            "indexing_requested": indexing_requested  # 🆕
+            "sitemap_pinged": sitemap_pinged,  # NOU
+            "indexing_requested": indexing_requested
         }
 
     except HTTPException:
@@ -1066,6 +1171,8 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {PORT}")
     logger.info(f"CORS origins: {origins}")
     logger.info(f"cPanel host: {CPANEL_HOST}:{CPANEL_PORT}")
+    logger.info(f"Article FTP Path: {ARTICLES_UPLOAD_PATH_FTP}")
+    logger.info(f"Sitemap FTP Path: {SITEMAP_UPLOAD_PATH_FTP}")
 
     uvicorn.run(
         "main:app",
