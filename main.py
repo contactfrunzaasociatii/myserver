@@ -9,6 +9,8 @@ from jinja2 import Environment, FileSystemLoader
 import xml.etree.ElementTree as ET
 import requests
 import logging
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -32,6 +34,13 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", 60))
 
+# Google Indexing API
+GOOGLE_PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID")
+GOOGLE_PRIVATE_KEY_ID = os.getenv("GOOGLE_PRIVATE_KEY_ID")
+GOOGLE_PRIVATE_KEY = os.getenv("GOOGLE_PRIVATE_KEY")
+GOOGLE_CLIENT_EMAIL = os.getenv("GOOGLE_CLIENT_EMAIL")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
 # Validare configurație
 required_vars = {
     "CPANEL_HOST": CPANEL_HOST,
@@ -47,6 +56,20 @@ required_vars = {
 missing_vars = [key for key, value in required_vars.items() if not value]
 if missing_vars:
     raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+# Check Google Indexing API credentials (optional but recommended)
+google_indexing_enabled = all([
+    GOOGLE_PROJECT_ID,
+    GOOGLE_PRIVATE_KEY_ID,
+    GOOGLE_PRIVATE_KEY,
+    GOOGLE_CLIENT_EMAIL,
+    GOOGLE_CLIENT_ID
+])
+
+if google_indexing_enabled:
+    logger.info("Google Indexing API is enabled")
+else:
+    logger.warning("Google Indexing API credentials not configured - indexing requests will be skipped")
 
 # Frontend / API
 GENERATED_DIR = "generated"
@@ -208,13 +231,23 @@ def upload_to_cpanel(local_path: str, remote_filename: str):
 
 # ==================== SITEMAP ====================
 def update_sitemap(new_url: str):
-    """Add new URL to sitemap.xml"""
+    """Add new URL to sitemap.xml without duplicates"""
     try:
         if os.path.exists(SITEMAP_FILE):
             tree = ET.parse(SITEMAP_FILE)
             root = tree.getroot()
         else:
             root = ET.Element("urlset", xmlns="http://www.sitemaps.org/schemas/sitemap/0.9")
+
+        # Verifică dacă URL-ul există deja
+        existing_urls = [url.find("{http://www.sitemaps.org/schemas/sitemap/0.9}loc").text
+                         if url.find("{http://www.sitemaps.org/schemas/sitemap/0.9}loc") is not None
+                         else url.find("loc").text
+                         for url in root.findall("{http://www.sitemaps.org/schemas/sitemap/0.9}url")]
+
+        if new_url in existing_urls:
+            logger.info(f"URL already exists in sitemap: {new_url}")
+            return  # nu adăuga duplicate
 
         url_elem = ET.Element("url")
         ET.SubElement(url_elem, "loc").text = new_url
@@ -240,9 +273,54 @@ def ping_google(sitemap_url: str):
             f"http://www.google.com/ping?sitemap={sitemap_url}",
             timeout=10
         )
-        logger.info(f"Google pinged successfully. Status: {response.status_code}")
+        logger.info(f"Google sitemap pinged successfully. Status: {response.status_code}")
     except Exception as e:
-        logger.warning(f"Failed to ping Google (non-critical): {e}")
+        logger.warning(f"Failed to ping Google sitemap (non-critical): {e}")
+
+
+def notify_google_indexing_api(url: str):
+    """
+    Notify Google Indexing API to request immediate indexing of a URL
+
+    Args:
+        url: The URL to be indexed
+    """
+    if not google_indexing_enabled:
+        logger.warning("Google Indexing API not configured - skipping indexing request")
+        return
+
+    try:
+        # Construim service account info din variabile de mediu
+        service_account_info = {
+            "type": "service_account",
+            "project_id": GOOGLE_PROJECT_ID,
+            "private_key_id": GOOGLE_PRIVATE_KEY_ID,
+            # Railway pune liniile private key într-o singură linie, trebuie să le transformăm în multiline
+            "private_key": GOOGLE_PRIVATE_KEY.replace("\\n", "\n"),
+            "client_email": GOOGLE_CLIENT_EMAIL,
+            "client_id": GOOGLE_CLIENT_ID,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{GOOGLE_CLIENT_EMAIL}",
+        }
+
+        # Creează credentials și client Indexing API
+        credentials = service_account.Credentials.from_service_account_info(
+            service_account_info,
+            scopes=["https://www.googleapis.com/auth/indexing"]
+        )
+        service = build("indexing", "v3", credentials=credentials)
+
+        # Trimite cerere de indexare
+        body = {"url": url, "type": "URL_UPDATED"}
+        response = service.urlNotifications().publish(body=body).execute()
+
+        logger.info(f"Google Indexing API notified successfully for URL: {url}")
+        logger.info(f"Response: {response}")
+
+    except Exception as e:
+        logger.warning(f"Google Indexing API request failed (non-critical): {e}")
 
 
 # ==================== CREATE ARTICLE ====================
@@ -302,15 +380,29 @@ async def create_article(
                 detail=f"Failed to upload article to server: {str(e)}"
             )
 
-        # Update sitemap
+        # Generate file URL
         file_url = f"{SITE_URL}/noutati/{filename}"
+
+        # Update sitemap and notify Google
         try:
+            # 1. Update sitemap
             update_sitemap(file_url)
+
+            # 2. Upload updated sitemap
             upload_to_cpanel(SITEMAP_FILE, "sitemap.xml")
-            ping_google(f"{SITE_URL}/sitemap.xml")
+
+            # 3. Ping Google about sitemap update
+            sitemap_url = f"{SITE_URL}/sitemap.xml"
+            ping_google(sitemap_url)
+
+            # 4. Request immediate indexing via Google Indexing API
+            notify_google_indexing_api(file_url)
+
+            logger.info(f"SEO operations completed for: {file_url}")
+
         except Exception as e:
-            logger.warning(f"Sitemap update failed (non-critical): {e}")
-            # Don't fail the whole operation if sitemap fails
+            logger.warning(f"SEO operations failed (non-critical): {e}")
+            # Don't fail the whole operation if SEO operations fail
 
         logger.info(f"Article published successfully: {file_url}")
 
@@ -318,7 +410,8 @@ async def create_article(
             "status": "success",
             "message": "Article created and published successfully",
             "file": filename,
-            "url": file_url
+            "url": file_url,
+            "indexing_requested": google_indexing_enabled
         }
 
     except HTTPException:
@@ -364,6 +457,7 @@ async def health_check():
             "cpanel_port": CPANEL_PORT,
             "site_url": SITE_URL,
             "upload_path_configured": bool(UPLOAD_PATH),
+            "google_indexing_enabled": google_indexing_enabled,
         }
     }
 
@@ -377,6 +471,7 @@ if __name__ == "__main__":
     logger.info(f"Starting server on port {PORT}")
     logger.info(f"CORS origins: {origins}")
     logger.info(f"cPanel host: {CPANEL_HOST}:{CPANEL_PORT}")
+    logger.info(f"Google Indexing API: {'enabled' if google_indexing_enabled else 'disabled'}")
 
     uvicorn.run(
         "main:app",
