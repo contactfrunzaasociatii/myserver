@@ -126,14 +126,16 @@ def get_db():
 
 # ==================== 3. INIT FASTAPI ====================
 app = FastAPI(title="CMS API (Paginare + Base64)")
-
+origins = [
+    "https://frunza-asociatii.ro",         # Domeniul tău fără www
+    "https://www.frunza-asociatii.ro",     # Domeniul tău cu www
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_origins=origins,      # <--- Aici specificăm cine are voie
+    allow_credentials=True,     # <--- IMPORTANT: Trebuie să fie True pentru autentificare
+    allow_methods=["*"],        # Permite orice metodă (GET, POST, DELETE, OPTIONS)
+    allow_headers=["*"],        # Permite orice header (inclusiv Authorization)
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
