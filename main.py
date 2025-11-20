@@ -515,6 +515,16 @@ async def create_article_json(
     return {"status": "success", "article": new_article}
 
 
+
+@app.get("/articles/slug/{slug}")  # Rută specifică pentru slug
+def get_article_by_slug(slug: str, db: Session = Depends(get_db)):
+    # Căutăm după coloana 'slug', nu după 'id'
+    article = db.query(ArticleDB).filter(ArticleDB.slug == slug).first()
+
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+
+    return article  # FastAPI va returna automat JSON-ul complet, inclusiv Base64
 @app.put("/articles/{article_id}")
 async def update_article(
         article_id: int,
