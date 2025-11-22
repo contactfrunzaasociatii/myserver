@@ -7,6 +7,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Query, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from googleapiclient.errors import HttpError
 
 # Database Imports
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, desc
@@ -152,22 +153,95 @@ def download_from_ftp(remote_filename: str, local_path: str, remote_dir: str):
         if ftp: ftp.quit()
 
 # ==================== GOOGLE INDEXING ====================
-def request_google_indexing(url: str, type="URL_UPDATED"):
+def request_google_indexing(url: str):
+    """
+    Request indexing for a URL using Google Indexing API
+
+    Args:
+        url: Full URL to index (e.g., https://frunza-asociatii.ro/noutati/article.html)
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
     try:
-        creds_dict = {
-            "type": "service_account",
-            "project_id": os.getenv("GOOGLE_PROJECT_ID"),
-            "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
-            "private_key": os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n","\n"),
-            "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
-            "client_id": os.getenv("GOOGLE_CLIENT_ID")
+        # Get credentials
+        credentials = get_service_account_credentials()
+        if not credentials:
+            logger.warning("⚠️ Google Indexing API not configured - skipping")
+            return False
+
+        # Build the service
+        service = build('indexing', 'v3', credentials=credentials)
+
+        # Request indexing
+        body = {
+            "url": url,
+            "type": "URL_UPDATED"
         }
-        creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-        service = build("indexing", "v3", credentials=creds)
-        service.urlNotifications().publish(body={"url": url, "type": type}).execute()
-        logger.info(f"Google Indexing ping {type} for {url}")
+
+        response = service.urlNotifications().publish(body=body).execute()
+
+        logger.info(f"✅ Google indexing requested successfully for: {url}")
+        logger.debug(f"Google API response: {response}")
+
+        return True
+
+    except HttpError as e:
+        # Handle specific Google API errors
+        if e.resp.status == 403:
+            logger.error(f"❌ Google API permission denied. Check service account permissions in Search Console")
+        elif e.resp.status == 429:
+            logger.error(f"❌ Google API rate limit exceeded. Try again later")
+        else:
+            logger.error(f"❌ Google Indexing API HTTP error ({e.resp.status}): {e.content}")
+        return False
     except Exception as e:
-        logger.error(f"Google Indexing Error: {e}")
+        logger.error(f"❌ Unexpected error requesting indexing: {e}")
+        return False
+def get_service_account_credentials():
+    """
+    Build Google service account credentials from environment variables
+
+    Returns:
+        google.oauth2.service_account.Credentials or None
+    """
+    try:
+        # Check if all required variables are present
+        project_id = os.getenv("GOOGLE_PROJECT_ID")
+        private_key = os.getenv("GOOGLE_PRIVATE_KEY")
+        client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
+
+        if not all([project_id, private_key, client_email]):
+            logger.warning("Google service account credentials not configured in environment")
+            return None
+
+        # Build credentials dictionary
+        credentials_dict = {
+            "type": "service_account",
+            "project_id": project_id,
+            "private_key_id": os.getenv("GOOGLE_PRIVATE_KEY_ID"),
+            "private_key": private_key.replace('\\n', '\n'),  # Convert literal \n to actual newlines
+            "client_email": client_email,
+            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1",
+            "client_x509_cert_url": f"https://www.googleapis.com/robot/v1/metadata/x509/{client_email.replace('@', '%40')}",
+            "universe_domain": "googleapis.com"
+        }
+
+        # Create credentials from dict
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_dict,
+            scopes=SCOPES
+        )
+
+        logger.info("✅ Google service account credentials loaded from environment variables")
+        return credentials
+
+    except Exception as e:
+        logger.error(f"❌ Error loading service account credentials: {e}")
+        return None
 
 # ==================== SITEMAP ====================
 def update_sitemap(new_url: str, changefreq: str = "weekly", priority: str = "0.8"):
