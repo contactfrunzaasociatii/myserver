@@ -126,19 +126,18 @@ def get_db():
 
 # ==================== 3. INIT FASTAPI ====================
 app = FastAPI(title="CMS API (Paginare + Base64)")
-origins = [
-    "https://frunza-asociatii.ro",
-    "https://www.frunza-asociatii.ro",
-    "http://localhost",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
-    "http://localhost:3000",
-]
+from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:8081",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "https://frunza-asociatii.ro",
+        "https://www.frunza-asociatii.ro",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
