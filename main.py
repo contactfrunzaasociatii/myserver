@@ -140,7 +140,9 @@ def upload_file_ftp(local_path: str, remote_filename: str, remote_dir: str):
         logger.error(f"FTP Upload Error: {e}")
         return False
     finally:
-        if ftp: try: ftp.quit(); except: pass
+        if ftp:
+            try: ftp.quit();
+            except: pass
 
 
 def delete_file_ftp(remote_filename: str, remote_dir: str):
@@ -159,7 +161,9 @@ def delete_file_ftp(remote_filename: str, remote_dir: str):
         logger.error(f"FTP Delete Error: {e}")
         return False
     finally:
-        if ftp: try: ftp.quit(); except: pass
+        if ftp:
+            try: ftp.quit();
+            except: pass
 
 
 def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str):
@@ -173,7 +177,9 @@ def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str)
     except:
         return False
     finally:
-        if ftp: try: ftp.quit(); except: pass
+        if ftp:
+            try: ftp.quit();
+            except: pass
 
 
 # ==================== 4. GOOGLE & SEO UTILS ====================
