@@ -5,13 +5,20 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import base64
 import math
+import smtplib
+import ssl  # <--- Lipsea acest import important pentru email securizat
 from datetime import datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import List, Optional, Dict, Any
 
 # FastAPI Imports
 from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Query, Body
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+
+# Pydantic Imports
+from pydantic import BaseModel, EmailStr
 
 # Database Imports
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, desc
@@ -33,7 +40,7 @@ import requests
 
 # ==================== 1. SETUP & CONFIGURARE ====================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)  # <--- CORECTAT: dublu underscore
 
 load_dotenv()
 
@@ -59,6 +66,13 @@ SITEMAP_UPLOAD_PATH_FTP = os.getenv("SITEMAP_UPLOAD_PATH_FTP", "/public_html")
 ARTICLES_URL_SUBDIR = os.getenv("ARTICLES_URL_SUBDIR", "noutati")
 SITE_URL = os.getenv("SITE_URL", "https://frunza-asociatii.ro")
 
+# --- EMAIL CONFIG ---
+EMAIL_HOST = os.getenv("EMAIL_HOST")
+EMAIL_PORT = int(os.getenv("EMAIL_PORT", 465))
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+
 # --- AUTH ---
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
@@ -76,7 +90,7 @@ env = Environment(loader=FileSystemLoader("templates"))
 
 # ==================== 2. MODEL BAZĂ DE DATE ====================
 class ArticleDB(Base):
-    __tablename__ = "articles"
+    __tablename__ = "articles"  # <--- CORECTAT: dublu underscore
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(500), nullable=False)
@@ -101,6 +115,15 @@ class ArticleDB(Base):
 Base.metadata.create_all(bind=engine)
 
 
+# Model Validare Contact
+class ContactForm(BaseModel):
+    name: str
+    email: EmailStr
+    phone: str
+    subject: str
+    message: str
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -109,7 +132,70 @@ def get_db():
         db.close()
 
 
-# ==================== 3. FTP UTILS ====================
+# ==================== 3. EMAIL UTILS (OPTIMIZAT) ====================
+
+def send_email(form_data: ContactForm):
+    try:
+        if not EMAIL_USER or not EMAIL_PASSWORD:
+            logger.error("Setările de email lipsesc din .env")
+            return False
+
+        msg = MIMEMultipart('alternative')
+
+        # 1. EXPEDITOR: Trebuie să fie contul tău autentificat (contactform@...)
+        # Putem pune un nume frumos în față
+        msg['From'] = f"Formular Site <{EMAIL_USER}>"
+
+        # 2. DESTINATAR: Unde ajunge mailul (contact@...)
+        msg['To'] = EMAIL_RECEIVER
+
+        # 3. REPLY-TO: AICI E TRUCUL!
+        # Când dai reply, te duci la adresa clientului
+        msg.add_header('Reply-To', form_data.email)
+
+        msg['Subject'] = f"[Mesaj Nou Site] {form_data.subject}"
+
+        html_body = f"""
+        <html>
+            <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f9f9f9; padding: 20px;">
+                <div style="max-width: 600px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                    <h2 style="color: #8B2635; margin-top: 0; border-bottom: 2px solid #8B2635; padding-bottom: 10px;">Mesaj nou de pe site</h2>
+
+                    <p style="font-size: 16px;"><strong>Expeditor:</strong> {form_data.name}</p>
+                    <p style="font-size: 16px;"><strong>Email Client:</strong> <a href="mailto:{form_data.email}" style="color: #8B2635;">{form_data.email}</a></p>
+                    <p style="font-size: 16px;"><strong>Telefon:</strong> {form_data.phone}</p>
+
+                    <div style="background-color: #f4f4f4; padding: 15px; border-left: 4px solid #8B2635; margin-top: 20px;">
+                        <p style="margin: 0;"><strong>Mesaj:</strong></p>
+                        <p style="margin-top: 5px; white-space: pre-wrap;">{form_data.message}</p>
+                    </div>
+
+                    <p style="color: #999; font-size: 12px; margin-top: 30px; text-align: center;">
+                        Acest email a fost trimis automat de pe frunza-asociatii.ro via contul {EMAIL_USER}.<br>
+                        Dă reply la acest email pentru a răspunde direct clientului ({form_data.email}).
+                    </p>
+                </div>
+            </body>
+        </html>
+        """
+
+        msg.attach(MIMEText(html_body, 'html'))
+        context = ssl.create_default_context()
+
+        # Folosim portul 465 (SSL) conform pozei tale
+        with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=context) as server:
+            server.login(EMAIL_USER, EMAIL_PASSWORD)
+            server.send_message(msg)
+
+        logger.info(f"Email trimis de la {EMAIL_USER} catre {EMAIL_RECEIVER} (Reply-To: {form_data.email})")
+        return True
+
+    except Exception as e:
+        logger.error(f"Eroare trimitere email: {e}")
+        return False
+
+
+# ==================== 4. FTP UTILS ====================
 
 def get_ftp_connection():
     ftp = FTP()
@@ -182,7 +268,7 @@ def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str)
             except: pass
 
 
-# ==================== 4. GOOGLE & SEO UTILS ====================
+# ==================== 5. GOOGLE & SEO UTILS ====================
 
 def request_google_indexing(url: str, type="URL_UPDATED"):
     """Trimite ping la Google Indexing API cu URL-ul CURAT (fără .html)"""
@@ -296,25 +382,16 @@ def generate_tags_html(tags_list):
     return "\n".join(html) if html else '<span class="tag">General</span>'
 
 
-# ==================== 5. PIPELINES (STATE MACHINE) ====================
+# ==================== 6. PIPELINES (STATE MACHINE) ====================
 
 def publish_content_pipeline(article: ArticleDB):
-    """
-    Executat când articolul este PUBLICAT.
-    1. Generează fișierul fizic (.html).
-    2. Folosește URL-ul curat (fără extensie) pentru SEO.
-    """
     try:
         tags_list = article.tags if article.tags else []
         if isinstance(tags_list, str): tags_list = tags_list.split(",")
 
-        # URL PUBLIC (Curat - Fără .html) -> Pentru Google & Sitemap
         public_url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{article.slug}"
-
-        # NUME FIȘIER FIZIC (Cu .html) -> Pentru FTP
         file_name = f"{article.slug}.html"
 
-        # 1. Render Template
         template = env.get_template("article_template.html")
         html_content = template.render(
             ARTICLE_TITLE=article.title,
@@ -329,7 +406,6 @@ def publish_content_pipeline(article: ArticleDB):
             ARTICLE_EXCERPT=article.excerpt or ""
         )
 
-        # 2. Salvare Temp & Upload FTP
         local_path = os.path.join(GENERATED_DIR, file_name)
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
@@ -341,10 +417,8 @@ def publish_content_pipeline(article: ArticleDB):
             logger.error("FTP Upload Failed")
             return False
 
-        # 3. SEO (Folosim URL-ul curat)
         update_sitemap(public_url)
         request_google_indexing(public_url, "URL_UPDATED")
-
         return True
     except Exception as e:
         logger.error(f"Publish Pipeline Failed: {e}")
@@ -352,29 +426,19 @@ def publish_content_pipeline(article: ArticleDB):
 
 
 def unpublish_content_pipeline(slug: str):
-    """
-    Executat când articolul este ASCUNS sau ȘTERS.
-    1. Șterge fișierul .html de pe server.
-    2. Șterge URL-ul curat din Google/Sitemap.
-    """
     try:
         file_name = f"{slug}.html"
         public_url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{slug}"
-
-        # 1. Șterge Fișier FTP
         delete_file_ftp(file_name, ARTICLES_UPLOAD_PATH_FTP)
-
-        # 2. Șterge SEO
         remove_from_sitemap(public_url)
         request_google_indexing(public_url, "URL_DELETED")
-
         return True
     except Exception as e:
         logger.error(f"Unpublish Pipeline Failed: {e}")
         return False
 
 
-# ==================== 6. API ENDPOINTS ====================
+# ==================== 7. API ENDPOINTS ====================
 
 app = FastAPI()
 
@@ -406,20 +470,26 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     raise HTTPException(status_code=400, detail="Invalid credentials")
 
 
+# --- CONTACT (Endpoint Public) ---
+@app.post("/contact")
+async def submit_contact(form: ContactForm):
+    success = send_email(form)
+    if success:
+        return {"status": "success", "message": "Mesajul a fost trimis!"}
+    else:
+        raise HTTPException(status_code=500, detail="Eroare server email.")
+
+
 # --- CREATE ---
 @app.post("/articles")
 async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     verify_jwt_token(token)
 
     slug = payload.get('slug')
-
-    # VERIFICARE UNICITATE SLUG (DB Check)
     if db.query(ArticleDB).filter(ArticleDB.slug == slug).first():
-        raise HTTPException(status_code=400, detail="Acest slug există deja. Alegeți alt titlu sau slug.")
+        raise HTTPException(status_code=400, detail="Slug existent.")
 
     status = "Published" if payload.get('status', '').lower() == "published" else "Draft"
-
-    # Salvăm URL-ul curat în DB (fără .html)
     public_url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{slug}"
 
     new_article = ArticleDB(
@@ -434,7 +504,6 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
     db.commit()
     db.refresh(new_article)
 
-    # Doar dacă e Published declanșăm pipeline-ul extern
     if status == "Published":
         publish_content_pipeline(new_article)
 
@@ -480,7 +549,7 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
                          db: Session = Depends(get_db)):
     verify_jwt_token(token)
     article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
-    if not article: raise HTTPException(status_code=404, detail="Article not found")
+    if not article: raise HTTPException(status_code=404)
 
     old_slug = article.slug
     old_status = article.status
@@ -488,12 +557,10 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     new_status = "Published" if payload.get('status', '').lower() == "published" else "Draft"
     new_slug = payload.get('slug', old_slug)
 
-    # Verificare slug unic doar dacă s-a schimbat
     if new_slug != old_slug:
         if db.query(ArticleDB).filter(ArticleDB.slug == new_slug).first():
-            raise HTTPException(status_code=400, detail="Noul slug există deja.")
+            raise HTTPException(status_code=400, detail="Slug ocupat.")
 
-    # Update DB
     article.title = payload.get('title', article.title)
     article.slug = new_slug
     article.category = payload.get('category', article.category)
@@ -503,7 +570,7 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     article.cover_image = payload.get('coverImage', article.cover_image)
     article.status = new_status
     article.updated_at = datetime.utcnow()
-    article.url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{new_slug}"  # URL Curat
+    article.url = f"{SITE_URL}/{ARTICLES_URL_SUBDIR}/{new_slug}"
 
     if new_status == "Published" and not article.published_at:
         article.published_at = datetime.utcnow()
@@ -512,17 +579,11 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     db.refresh(article)
 
     # State Machine Logic
-
-    # Cazul 1: Era Published -> Acum e Draft (Unpublish)
     if old_status == "Published" and new_status == "Draft":
         unpublish_content_pipeline(old_slug)
-
-    # Cazul 2: Slug Change (Published -> Published cu slug nou)
     elif old_status == "Published" and new_status == "Published" and old_slug != new_slug:
-        unpublish_content_pipeline(old_slug)  # Ștergem vechiul (inclusiv din sitemap/google)
-        publish_content_pipeline(article)  # Creăm noul
-
-    # Cazul 3: Content Update / Publish (Draft -> Published SAU Published -> Published)
+        unpublish_content_pipeline(old_slug)
+        publish_content_pipeline(article)
     elif new_status == "Published":
         publish_content_pipeline(article)
 
@@ -546,7 +607,6 @@ async def patch_status(article_id: int, payload: dict = Body(...), token: str = 
 
     db.commit()
 
-    # Logică simplificată pentru Toggle
     if old_status == "Published" and new_status == "Draft":
         unpublish_content_pipeline(article.slug)
     elif new_status == "Published":
@@ -568,7 +628,6 @@ async def delete_article(article_id: int, token: str = Depends(oauth2_scheme), d
     db.delete(article)
     db.commit()
 
-    # Doar dacă era publicat ștergem de pe net
     if status_was == "Published":
         unpublish_content_pipeline(slug_to_remove)
 
@@ -577,6 +636,5 @@ async def delete_article(article_id: int, token: str = Depends(oauth2_scheme), d
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
