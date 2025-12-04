@@ -1,16 +1,15 @@
 import os
-import json
 import logging
+import json
 import urllib.parse
 import xml.etree.ElementTree as ET
 import base64
 import math
-import smtplib
-import ssl  # <--- Lipsea acest import important pentru email securizat
 from datetime import datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import List, Optional, Dict, Any
+
+# --- NOU: IMPORT RESEND ---
+import resend
 
 # FastAPI Imports
 from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Query, Body
@@ -40,7 +39,7 @@ import requests
 
 # ==================== 1. SETUP & CONFIGURARE ====================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)  # <--- CORECTAT: dublu underscore
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -59,19 +58,18 @@ CPANEL_PORT = int(os.getenv("CPANEL_PORT", 21))
 CPANEL_USER = os.getenv("CPANEL_USERNAME")
 CPANEL_PASSWORD = os.getenv("CPANEL_PASSWORD")
 
-# Căi FTP (fără slash la final)
 ARTICLES_UPLOAD_PATH_FTP = os.getenv("ARTICLES_UPLOAD_PATH_FTP", "/public_html/noutati")
 SITEMAP_UPLOAD_PATH_FTP = os.getenv("SITEMAP_UPLOAD_PATH_FTP", "/public_html")
-
 ARTICLES_URL_SUBDIR = os.getenv("ARTICLES_URL_SUBDIR", "noutati")
 SITE_URL = os.getenv("SITE_URL", "https://frunza-asociatii.ro")
 
-# --- EMAIL CONFIG ---
-EMAIL_HOST = os.getenv("EMAIL_HOST")
-EMAIL_PORT = int(os.getenv("EMAIL_PORT", 465))
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+# --- EMAIL CONFIG (RESEND) ---
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
+
+# Inițializare Resend
+if RESEND_API_KEY:
+    resend.api_key = RESEND_API_KEY
 
 # --- AUTH ---
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -88,9 +86,11 @@ if not os.path.exists("templates"):
 env = Environment(loader=FileSystemLoader("templates"))
 
 
-# ==================== 2. MODEL BAZĂ DE DATE ====================
+# ==================== 2. MODELE (DB & Validare) ====================
+
+# Model DB - Articole
 class ArticleDB(Base):
-    __tablename__ = "articles"  # <--- CORECTAT: dublu underscore
+    __tablename__ = "articles"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(500), nullable=False)
@@ -98,15 +98,11 @@ class ArticleDB(Base):
     category = Column(String(100), nullable=False)
     tags = Column(JSON, default=[])
     excerpt = Column(Text, nullable=True)
-    cover_image = Column(Text, nullable=True)  # Base64 string
+    cover_image = Column(Text, nullable=True)
     content = Column(Text, nullable=False)
-
-    # Status este salvat ca 'Published' sau 'Draft'
     status = Column(String(50), default="Draft")
-
     author = Column(String(100), default="Frunză & Asociații")
-    url = Column(String(500), nullable=True)  # URL Public (Clean URL)
-
+    url = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     published_at = Column(DateTime, nullable=True)
@@ -115,7 +111,7 @@ class ArticleDB(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# Model Validare Contact
+# Model Validare - Contact
 class ContactForm(BaseModel):
     name: str
     email: EmailStr
@@ -132,66 +128,58 @@ def get_db():
         db.close()
 
 
-# ==================== 3. EMAIL UTILS (OPTIMIZAT) ====================
+# ==================== 3. EMAIL UTILS (RESEND API) ====================
 
 def send_email(form_data: ContactForm):
+    """
+    Trimite email folosind Resend API (HTTP).
+    Nu necesită porturi SMTP deschise, deci funcționează pe Railway.
+    """
     try:
-        if not EMAIL_USER or not EMAIL_PASSWORD:
-            logger.error("Setările de email lipsesc din .env")
+        if not RESEND_API_KEY:
+            logger.error("Lipseste RESEND_API_KEY din variabilele de mediu")
             return False
-
-        msg = MIMEMultipart('alternative')
-
-        # 1. EXPEDITOR: Trebuie să fie contul tău autentificat (contactform@...)
-        # Putem pune un nume frumos în față
-        msg['From'] = f"Formular Site <{EMAIL_USER}>"
-
-        # 2. DESTINATAR: Unde ajunge mailul (contact@...)
-        msg['To'] = EMAIL_RECEIVER
-
-        # 3. REPLY-TO: AICI E TRUCUL!
-        # Când dai reply, te duci la adresa clientului
-        msg.add_header('Reply-To', form_data.email)
-
-        msg['Subject'] = f"[Mesaj Nou Site] {form_data.subject}"
 
         html_body = f"""
         <html>
-            <body style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; line-height: 1.6; color: #333; background-color: #f9f9f9; padding: 20px;">
-                <div style="max-width: 600px; margin: 0 auto; background: #ffffff; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-                    <h2 style="color: #8B2635; margin-top: 0; border-bottom: 2px solid #8B2635; padding-bottom: 10px;">Mesaj nou de pe site</h2>
-
-                    <p style="font-size: 16px;"><strong>Expeditor:</strong> {form_data.name}</p>
-                    <p style="font-size: 16px;"><strong>Email Client:</strong> <a href="mailto:{form_data.email}" style="color: #8B2635;">{form_data.email}</a></p>
-                    <p style="font-size: 16px;"><strong>Telefon:</strong> {form_data.phone}</p>
-
-                    <div style="background-color: #f4f4f4; padding: 15px; border-left: 4px solid #8B2635; margin-top: 20px;">
-                        <p style="margin: 0;"><strong>Mesaj:</strong></p>
-                        <p style="margin-top: 5px; white-space: pre-wrap;">{form_data.message}</p>
-                    </div>
-
-                    <p style="color: #999; font-size: 12px; margin-top: 30px; text-align: center;">
-                        Acest email a fost trimis automat de pe frunza-asociatii.ro via contul {EMAIL_USER}.<br>
-                        Dă reply la acest email pentru a răspunde direct clientului ({form_data.email}).
-                    </p>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <h2 style="color: #8B2635;">Mesaj nou de pe site</h2>
+                <p><strong>Nume:</strong> {form_data.name}</p>
+                <p><strong>Email Client:</strong> {form_data.email}</p>
+                <p><strong>Telefon:</strong> {form_data.phone}</p>
+                <p><strong>Subiect:</strong> {form_data.subject}</p>
+                <hr>
+                <div style="background-color: #f9f9f9; padding: 15px; border-left: 4px solid #8B2635;">
+                    <strong>Mesaj:</strong><br>
+                    {form_data.message}
                 </div>
+                <p style="font-size: 12px; color: #888; margin-top: 20px;">
+                    Acest mesaj a fost trimis de pe site-ul {SITE_URL}.<br>
+                    Răspunde la acest email pentru a contacta direct clientul.
+                </p>
             </body>
         </html>
         """
 
-        msg.attach(MIMEText(html_body, 'html'))
-        context = ssl.create_default_context()
+        # IMPORTANT:
+        # Folosim onboarding@resend.dev pana cand verifici domeniul.
+        # Dupa ce verifici domeniul pe Resend, poti pune: "Contact <contact@frunza-asociatii.ro>"
+        sender_email = "onboarding@resend.dev"
 
-        # Folosim portul 465 (SSL) conform pozei tale
-        with smtplib.SMTP_SSL(EMAIL_HOST, EMAIL_PORT, context=context) as server:
-            server.login(EMAIL_USER, EMAIL_PASSWORD)
-            server.send_message(msg)
+        params = {
+            "from": f"Formular Site <{sender_email}>",
+            "to": [EMAIL_RECEIVER],
+            "subject": f"[Contact Site] {form_data.subject}",
+            "html": html_body,
+            "reply_to": form_data.email  # Permite să dai reply direct clientului
+        }
 
-        logger.info(f"Email trimis de la {EMAIL_USER} catre {EMAIL_RECEIVER} (Reply-To: {form_data.email})")
+        r = resend.Emails.send(params)
+        logger.info(f"Email trimis cu succes via Resend. ID: {r.get('id')}")
         return True
 
     except Exception as e:
-        logger.error(f"Eroare trimitere email: {e}")
+        logger.error(f"Eroare Resend: {e}")
         return False
 
 
@@ -205,7 +193,6 @@ def get_ftp_connection():
 
 
 def upload_file_ftp(local_path: str, remote_filename: str, remote_dir: str):
-    """Urcă un fișier pe FTP. Creează folderul dacă nu există."""
     ftp = None
     try:
         ftp = get_ftp_connection()
@@ -220,36 +207,34 @@ def upload_file_ftp(local_path: str, remote_filename: str, remote_dir: str):
 
         with open(local_path, 'rb') as f:
             ftp.storbinary(f'STOR {remote_filename}', f)
-        logger.info(f"FTP: Uploaded {remote_filename}")
+        logger.info(f"FTP Uploaded: {remote_filename}")
         return True
     except Exception as e:
         logger.error(f"FTP Upload Error: {e}")
         return False
     finally:
         if ftp:
-            try: ftp.quit();
-            except: pass
+            try:
+                ftp.quit();
+            except:
+                pass
 
 
 def delete_file_ftp(remote_filename: str, remote_dir: str):
-    """Șterge un fișier de pe FTP"""
     ftp = None
     try:
         ftp = get_ftp_connection()
         ftp.cwd(remote_dir)
         ftp.delete(remote_filename)
-        logger.info(f"FTP: Deleted {remote_filename}")
         return True
-    except error_perm:
-        # Fișierul poate nu există, ceea ce e OK în contextul ștergerii
+    except:
         return True
-    except Exception as e:
-        logger.error(f"FTP Delete Error: {e}")
-        return False
     finally:
         if ftp:
-            try: ftp.quit();
-            except: pass
+            try:
+                ftp.quit();
+            except:
+                pass
 
 
 def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str):
@@ -264,14 +249,15 @@ def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str)
         return False
     finally:
         if ftp:
-            try: ftp.quit();
-            except: pass
+            try:
+                ftp.quit();
+            except:
+                pass
 
 
-# ==================== 5. GOOGLE & SEO UTILS ====================
+# ==================== 5. SEO & GOOGLE UTILS ====================
 
 def request_google_indexing(url: str, type="URL_UPDATED"):
-    """Trimite ping la Google Indexing API cu URL-ul CURAT (fără .html)"""
     try:
         if not os.getenv("GOOGLE_CLIENT_EMAIL"): return False
         creds_dict = {
@@ -287,15 +273,13 @@ def request_google_indexing(url: str, type="URL_UPDATED"):
         creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
         service = build('indexing', 'v3', credentials=creds)
         service.urlNotifications().publish(body={"url": url, "type": type}).execute()
-        logger.info(f"Google Ping: {url} [{type}]")
         return True
     except Exception as e:
-        logger.error(f"Google Indexing Error: {e}")
+        logger.error(f"Google Error: {e}")
         return False
 
 
 def update_sitemap(new_url: str):
-    """Adaugă URL-ul CURAT în sitemap.xml"""
     LOCAL_SITEMAP = os.path.join(GENERATED_DIR, "sitemap.xml")
     try:
         download_from_cpanel("sitemap.xml", LOCAL_SITEMAP, SITEMAP_UPLOAD_PATH_FTP)
@@ -313,8 +297,6 @@ def update_sitemap(new_url: str):
 
         ns = {'s': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
         found = False
-
-        # Căutăm dacă există deja URL-ul
         for url in root.findall("s:url", ns):
             loc = url.find("s:loc", ns)
             if loc is not None and loc.text == new_url:
@@ -332,17 +314,14 @@ def update_sitemap(new_url: str):
         tree = ET.ElementTree(root)
         ET.register_namespace('', "http://www.sitemaps.org/schemas/sitemap/0.9")
         tree.write(LOCAL_SITEMAP, encoding="utf-8", xml_declaration=True)
-
         upload_file_ftp(LOCAL_SITEMAP, "sitemap.xml", SITEMAP_UPLOAD_PATH_FTP)
         requests.get(f"https://www.google.com/ping?sitemap={urllib.parse.quote(SITE_URL + '/sitemap.xml')}", timeout=5)
         return True
-    except Exception as e:
-        logger.error(f"Sitemap Error: {e}")
+    except Exception:
         return False
 
 
 def remove_from_sitemap(target_url: str):
-    """Șterge URL-ul din sitemap"""
     LOCAL_SITEMAP = os.path.join(GENERATED_DIR, "sitemap.xml")
     try:
         download_from_cpanel("sitemap.xml", LOCAL_SITEMAP, SITEMAP_UPLOAD_PATH_FTP)
@@ -364,14 +343,9 @@ def remove_from_sitemap(target_url: str):
         if found:
             tree.write(LOCAL_SITEMAP, encoding="utf-8", xml_declaration=True)
             upload_file_ftp(LOCAL_SITEMAP, "sitemap.xml", SITEMAP_UPLOAD_PATH_FTP)
-            requests.get(f"https://www.google.com/ping?sitemap={urllib.parse.quote(SITE_URL + '/sitemap.xml')}",
-                         timeout=5)
-            logger.info(f"Sitemap: Removed {target_url}")
             return True
-
         return False
-    except Exception as e:
-        logger.error(f"Sitemap Remove Error: {e}")
+    except Exception:
         return False
 
 
@@ -382,7 +356,7 @@ def generate_tags_html(tags_list):
     return "\n".join(html) if html else '<span class="tag">General</span>'
 
 
-# ==================== 6. PIPELINES (STATE MACHINE) ====================
+# ==================== 6. PIPELINES (PUBLISH/UNPUBLISH) ====================
 
 def publish_content_pipeline(article: ArticleDB):
     try:
@@ -410,18 +384,13 @@ def publish_content_pipeline(article: ArticleDB):
         with open(local_path, "w", encoding="utf-8") as f:
             f.write(html_content)
 
-        success = upload_file_ftp(local_path, file_name, ARTICLES_UPLOAD_PATH_FTP)
-        if os.path.exists(local_path): os.remove(local_path)
-
-        if not success:
-            logger.error("FTP Upload Failed")
-            return False
-
-        update_sitemap(public_url)
-        request_google_indexing(public_url, "URL_UPDATED")
-        return True
+        if upload_file_ftp(local_path, file_name, ARTICLES_UPLOAD_PATH_FTP):
+            update_sitemap(public_url)
+            request_google_indexing(public_url, "URL_UPDATED")
+            return True
+        return False
     except Exception as e:
-        logger.error(f"Publish Pipeline Failed: {e}")
+        logger.error(f"Publish Failed: {e}")
         return False
 
 
@@ -433,8 +402,7 @@ def unpublish_content_pipeline(slug: str):
         remove_from_sitemap(public_url)
         request_google_indexing(public_url, "URL_DELETED")
         return True
-    except Exception as e:
-        logger.error(f"Unpublish Pipeline Failed: {e}")
+    except Exception:
         return False
 
 
@@ -444,7 +412,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Permite oricui (Pentru dev/Railway)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -470,21 +438,20 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     raise HTTPException(status_code=400, detail="Invalid credentials")
 
 
-# --- CONTACT (Endpoint Public) ---
+# --- CONTACT FORM (RESEND) ---
 @app.post("/contact")
 async def submit_contact(form: ContactForm):
     success = send_email(form)
     if success:
-        return {"status": "success", "message": "Mesajul a fost trimis!"}
+        return {"status": "success", "message": "Email trimis via Resend!"}
     else:
         raise HTTPException(status_code=500, detail="Eroare server email.")
 
 
-# --- CREATE ---
+# --- ARTICLES CRUD ---
 @app.post("/articles")
 async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     verify_jwt_token(token)
-
     slug = payload.get('slug')
     if db.query(ArticleDB).filter(ArticleDB.slug == slug).first():
         raise HTTPException(status_code=400, detail="Slug existent.")
@@ -499,7 +466,6 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
         status=status, url=public_url,
         published_at=datetime.utcnow() if status == "Published" else None
     )
-
     db.add(new_article)
     db.commit()
     db.refresh(new_article)
@@ -510,13 +476,11 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
     return {"status": "success", "article": new_article}
 
 
-# --- READ ---
 @app.get("/articles")
 def get_articles(page: int = 1, limit: int = 6, search: str = None, db: Session = Depends(get_db)):
     query = db.query(ArticleDB)
     if search: query = query.filter(ArticleDB.title.ilike(f"%{search}%"))
     query = query.order_by(desc(ArticleDB.created_at))
-
     total = query.count()
     articles = query.offset((page - 1) * limit).limit(limit).all()
 
@@ -524,26 +488,25 @@ def get_articles(page: int = 1, limit: int = 6, search: str = None, db: Session 
         "status": "success", "data": articles,
         "pagination": {
             "current_page": page, "items_per_page": limit, "total_items": total,
-            "total_pages": math.ceil(total / limit), "has_next": page < math.ceil(total / limit), "has_prev": page > 1
+            "total_pages": math.ceil(total / limit)
         }
     }
 
 
 @app.get("/articles/{article_id}")
-def get_article_by_id(article_id: int, db: Session = Depends(get_db)):
-    article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
-    if not article: raise HTTPException(status_code=404)
-    return article
+def get_article(article_id: int, db: Session = Depends(get_db)):
+    art = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
+    if not art: raise HTTPException(status_code=404)
+    return art
 
 
 @app.get("/articles/slug/{slug}")
-def get_article_by_slug(slug: str, db: Session = Depends(get_db)):
-    article = db.query(ArticleDB).filter(ArticleDB.slug == slug).first()
-    if not article: raise HTTPException(status_code=404)
-    return article
+def get_article_slug(slug: str, db: Session = Depends(get_db)):
+    art = db.query(ArticleDB).filter(ArticleDB.slug == slug).first()
+    if not art: raise HTTPException(status_code=404)
+    return art
 
 
-# --- UPDATE ---
 @app.put("/articles/{article_id}")
 async def update_article(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
                          db: Session = Depends(get_db)):
@@ -553,13 +516,11 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
 
     old_slug = article.slug
     old_status = article.status
-
     new_status = "Published" if payload.get('status', '').lower() == "published" else "Draft"
     new_slug = payload.get('slug', old_slug)
 
-    if new_slug != old_slug:
-        if db.query(ArticleDB).filter(ArticleDB.slug == new_slug).first():
-            raise HTTPException(status_code=400, detail="Slug ocupat.")
+    if new_slug != old_slug and db.query(ArticleDB).filter(ArticleDB.slug == new_slug).first():
+        raise HTTPException(status_code=400, detail="Slug ocupat.")
 
     article.title = payload.get('title', article.title)
     article.slug = new_slug
@@ -578,7 +539,7 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     db.commit()
     db.refresh(article)
 
-    # State Machine Logic
+    # State Machine Update
     if old_status == "Published" and new_status == "Draft":
         unpublish_content_pipeline(old_slug)
     elif old_status == "Published" and new_status == "Published" and old_slug != new_slug:
@@ -590,7 +551,6 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     return {"status": "success", "article": article}
 
 
-# --- PATCH STATUS ---
 @app.patch("/articles/{article_id}")
 async def patch_status(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
                        db: Session = Depends(get_db)):
@@ -615,26 +575,25 @@ async def patch_status(article_id: int, payload: dict = Body(...), token: str = 
     return {"status": "success", "article": article}
 
 
-# --- DELETE ---
 @app.delete("/articles/{article_id}")
 async def delete_article(article_id: int, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     verify_jwt_token(token)
     article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
     if not article: raise HTTPException(status_code=404)
 
-    slug_to_remove = article.slug
-    status_was = article.status
-
+    slug = article.slug
+    was_published = (article.status == "Published")
     db.delete(article)
     db.commit()
 
-    if status_was == "Published":
-        unpublish_content_pipeline(slug_to_remove)
+    if was_published:
+        unpublish_content_pipeline(slug)
 
-    return {"status": "success", "message": "Deleted"}
+    return {"status": "success"}
 
 
 if __name__ == "__main__":
     import uvicorn
+
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
