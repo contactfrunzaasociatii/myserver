@@ -133,7 +133,7 @@ def get_db():
 def send_email(form_data: ContactForm):
     """
     Trimite email folosind Resend API (HTTP).
-    Nu necesită porturi SMTP deschise, deci funcționează pe Railway.
+    Folosește domeniul verificat pentru livrabilitate maximă.
     """
     try:
         if not RESEND_API_KEY:
@@ -161,17 +161,23 @@ def send_email(form_data: ContactForm):
         </html>
         """
 
-        # IMPORTANT:
-        # Folosim onboarding@resend.dev pana cand verifici domeniul.
-        # Dupa ce verifici domeniul pe Resend, poti pune: "Contact <contact@frunza-asociatii.ro>"
-        sender_email = "onboarding@resend.dev"
+        # --- MODIFICAREA ESTE AICI ---
+        # 1. Asigură-te că domeniul 'frunza-asociatii.ro' are statusul "Verified" în Resend Dashboard -> Domains.
+        # 2. Folosește o adresă de pe domeniul tău (ex: contact@, notificari@, no-reply@).
+        sender_email = "contact@frunza-asociatii.ro"
 
         params = {
+            # "from": Aici serverele văd că expeditorul este legitim (domeniul tău)
             "from": f"Formular Site <{sender_email}>",
+
+            # "to": Aici primești tu notificarea (probabil tot pe contact@ sau pe adresa ta personală)
             "to": [EMAIL_RECEIVER],
+
             "subject": f"[Contact Site] {form_data.subject}",
             "html": html_body,
-            "reply_to": form_data.email  # Permite să dai reply direct clientului
+
+            # "reply_to": CRUCIAL - Când dai "Reply" în Outlook/Gmail, răspunsul se duce la client
+            "reply_to": form_data.email
         }
 
         r = resend.Emails.send(params)
