@@ -17,7 +17,7 @@ from PIL import Image  # pip install Pillow
 import resend
 
 # FastAPI Imports
-from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Query, Body
+from fastapi import FastAPI, Depends, HTTPException, Form, File, UploadFile, Query, Body, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -534,7 +534,13 @@ async def submit_contact(form: ContactForm):
 
 # --- ARTICLES CRUD ---
 @app.post("/articles")
-async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def create_article(
+    payload: dict = Body(...),
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None
+):
+
     verify_jwt_token(token)
     slug = payload.get('slug')
     if db.query(ArticleDB).filter(ArticleDB.slug == slug).first():
@@ -555,8 +561,7 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
     db.refresh(new_article)
 
     if status == "Published":
-        publish_content_pipeline(new_article)
-
+        background_tasks.add_task(publish_content_pipeline, new_article)
     return {"status": "success", "article": new_article}
 
 
@@ -622,8 +627,13 @@ def get_article_by_slug(slug: str, db: Session = Depends(get_db)):
 
 
 @app.put("/articles/{article_id}")
-async def update_article(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
-                         db: Session = Depends(get_db)):
+async def update_article(
+        article_id: int,
+        payload: dict = Body(...),
+        token: str = Depends(oauth2_scheme),
+        db: Session = Depends(get_db),
+        background_tasks: BackgroundTasks = None  # <--- PARAMETRU NOU
+):
     verify_jwt_token(token)
     article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
     if not article: raise HTTPException(status_code=404)
@@ -633,9 +643,11 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     new_status = "Published" if payload.get('status', '').lower() == "published" else "Draft"
     new_slug = payload.get('slug', old_slug)
 
+    # Verificare slug unic
     if new_slug != old_slug and db.query(ArticleDB).filter(ArticleDB.slug == new_slug).first():
         raise HTTPException(status_code=400, detail="Slug ocupat.")
 
+    # Actualizare câmpuri
     article.title = payload.get('title', article.title)
     article.slug = new_slug
     article.category = payload.get('category', article.category)
@@ -651,22 +663,33 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
         article.published_at = datetime.utcnow()
 
     db.commit()
-    db.refresh(article)
+    db.refresh(article)  # Important: Reimprospătăm datele înainte de a le trimite în background
 
+    # --- LOGICA BACKGROUND TASKS (Nu mai aștepți 9s) ---
     if old_status == "Published" and new_status == "Draft":
-        unpublish_content_pipeline(old_slug)
+        # A devenit Draft -> Ștergem de pe site
+        background_tasks.add_task(unpublish_content_pipeline, old_slug)
+
     elif old_status == "Published" and new_status == "Published" and old_slug != new_slug:
-        unpublish_content_pipeline(old_slug)
-        publish_content_pipeline(article)
+        # Slug schimbat -> Ștergem vechiul URL, publicăm pe cel nou
+        background_tasks.add_task(unpublish_content_pipeline, old_slug)
+        background_tasks.add_task(publish_content_pipeline, article)
+
     elif new_status == "Published":
-        publish_content_pipeline(article)
+        # Doar actualizare conținut sau publicare nouă
+        background_tasks.add_task(publish_content_pipeline, article)
 
     return {"status": "success", "article": article}
 
 
 @app.patch("/articles/{article_id}")
-async def patch_status(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
-                       db: Session = Depends(get_db)):
+async def patch_status(
+    article_id: int,
+    payload: dict = Body(...),
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = None  # <--- PARAMETRU NOU
+):
     verify_jwt_token(token)
     article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
     if not article: raise HTTPException(status_code=404)
@@ -679,28 +702,40 @@ async def patch_status(article_id: int, payload: dict = Body(...), token: str = 
         article.published_at = datetime.utcnow()
 
     db.commit()
+    db.refresh(article) # Reimprospătăm obiectul
 
+    # --- LOGICA BACKGROUND TASKS ---
     if old_status == "Published" and new_status == "Draft":
-        unpublish_content_pipeline(article.slug)
+        # Retragem de pe site
+        background_tasks.add_task(unpublish_content_pipeline, article.slug)
     elif new_status == "Published":
-        publish_content_pipeline(article)
+        # Publicăm pe site
+        background_tasks.add_task(publish_content_pipeline, article)
 
     return {"status": "success", "article": article}
 
 
 @app.delete("/articles/{article_id}")
-async def delete_article(article_id: int, token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def delete_article(
+        article_id: int,
+        token: str = Depends(oauth2_scheme),
+        db: Session = Depends(get_db),
+        background_tasks: BackgroundTasks = None  # <--- PARAMETRU NOU
+):
     verify_jwt_token(token)
     article = db.query(ArticleDB).filter(ArticleDB.id == article_id).first()
     if not article: raise HTTPException(status_code=404)
 
     slug = article.slug
     was_published = (article.status == "Published")
+
     db.delete(article)
     db.commit()
 
+    # --- LOGICA BACKGROUND TASKS ---
     if was_published:
-        unpublish_content_pipeline(slug)
+        # Ștergem fișierul HTML și actualizăm sitemap-ul în fundal
+        background_tasks.add_task(unpublish_content_pipeline, slug)
 
     return {"status": "success"}
 
