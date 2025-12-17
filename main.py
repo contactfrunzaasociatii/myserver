@@ -20,8 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 
 # Database Imports
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, desc
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, JSON, desc, Index, func
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
 # FTP Import
@@ -92,24 +92,38 @@ env = Environment(loader=FileSystemLoader("templates"))
 class ArticleDB(Base):
     __tablename__ = "articles"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     title = Column(String(500), nullable=False)
     slug = Column(String(500), unique=True, index=True, nullable=False)
-    category = Column(String(100), nullable=False)
-    tags = Column(JSON, default=[])
-    excerpt = Column(Text, nullable=True)
-    cover_image = Column(Text, nullable=True)
+    category = Column(String(100), index=True)
+    tags = Column(JSON, default=list)
+    excerpt = Column(Text)
+    cover_image = Column(Text)
     content = Column(Text, nullable=False)
-    status = Column(String(50), default="Draft")
+    status = Column(String(50), index=True, default="Draft")
     author = Column(String(100), default="Frunză & Asociații")
-    url = Column(String(500), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    url = Column(String(500))
+    created_at = Column(DateTime, index=True, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    published_at = Column(DateTime, nullable=True)
+    published_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_articles_status_created", "status", "created_at"),
+    )
 
 
 Base.metadata.create_all(bind=engine)
 
+class ArticleListItem(BaseModel):
+    id: int
+    title: str
+    slug: str
+    category: str
+    excerpt: Optional[str]
+    cover_image: Optional[str]
+    author: str
+    created_at: datetime
+    published_at: Optional[datetime]
 
 # Model Validare - Contact
 class ContactForm(BaseModel):
@@ -483,20 +497,50 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
 
 
 @app.get("/articles")
-def get_articles(page: int = 1, limit: int = 6, search: str = None, db: Session = Depends(get_db)):
-    query = db.query(ArticleDB)
-    if search: query = query.filter(ArticleDB.title.ilike(f"%{search}%"))
-    query = query.order_by(desc(ArticleDB.created_at))
-    total = query.count()
-    articles = query.offset((page - 1) * limit).limit(limit).all()
+def get_articles(
+    page: int = 1,
+    limit: int = 6,
+    db: Session = Depends(get_db)
+):
+    base_query = db.query(ArticleDB).filter(ArticleDB.status == "Published")
+
+    total = base_query.with_entities(func.count()).scalar()
+
+    rows = (
+        base_query
+        .order_by(desc(ArticleDB.created_at))
+        .offset((page - 1) * limit)
+        .limit(limit)
+        .with_entities(
+            ArticleDB.id,
+            ArticleDB.title,
+            ArticleDB.slug,
+            ArticleDB.category,
+            ArticleDB.excerpt,
+            ArticleDB.cover_image,
+            ArticleDB.author,
+            ArticleDB.created_at,
+            ArticleDB.published_at,
+        )
+        .all()
+    )
+
+    articles = [
+        ArticleListItem(**dict(r._mapping)) for r in rows
+    ]
 
     return {
-        "status": "success", "data": articles,
+        "status": "success",
+        "data": articles,
         "pagination": {
-            "current_page": page, "items_per_page": limit, "total_items": total,
+            "current_page": page,
+            "items_per_page": limit,
+            "total_items": total,
             "total_pages": math.ceil(total / limit)
         }
     }
+
+
 
 
 @app.get("/articles/{article_id}")
@@ -507,11 +551,14 @@ def get_article(article_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/articles/slug/{slug}")
-def get_article_slug(slug: str, db: Session = Depends(get_db)):
-    art = db.query(ArticleDB).filter(ArticleDB.slug == slug).first()
-    if not art: raise HTTPException(status_code=404)
-    return art
-
+def get_article_by_slug(slug: str, db: Session = Depends(get_db)):
+    article = db.query(ArticleDB).filter(
+        ArticleDB.slug == slug,
+        ArticleDB.status == "Published"
+    ).first()
+    if not article:
+        raise HTTPException(status_code=404)
+    return article
 
 @app.put("/articles/{article_id}")
 async def update_article(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
