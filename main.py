@@ -114,6 +114,7 @@ class ArticleDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# Caută clasa ArticleListItem și adaugă linia cu status
 class ArticleListItem(BaseModel):
     id: int
     title: str
@@ -124,6 +125,7 @@ class ArticleListItem(BaseModel):
     author: str
     created_at: datetime
     published_at: Optional[datetime]
+    status: str  # <--- ADOUGĂ ACEASTĂ LINIE
 
 # Model Validare - Contact
 class ContactForm(BaseModel):
@@ -502,7 +504,7 @@ def get_articles(
     limit: int = 6,
     db: Session = Depends(get_db)
 ):
-    base_query = db.query(ArticleDB).filter(ArticleDB.status == "Published")
+    base_query = db.query(ArticleDB)
 
     total = base_query.with_entities(func.count()).scalar()
 
@@ -521,6 +523,7 @@ def get_articles(
             ArticleDB.author,
             ArticleDB.created_at,
             ArticleDB.published_at,
+            ArticleDB.status,
         )
         .all()
     )
