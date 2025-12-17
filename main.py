@@ -431,12 +431,17 @@ def unpublish_content_pipeline(slug: str):
 
 app = FastAPI()
 
+origins = [
+    "https://frunza-asociatii.ro",  # Domeniul tău principal
+    "https://www.frunza-asociatii.ro",  # Varianta cu www
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=origins,  # <--- Folosește lista de mai sus, nu ["*"]
+    allow_credentials=True,  # Obligatoriu True pentru logare/tokeni
+    allow_methods=["*"],  # Permite orice metodă (GET, POST, PUT, DELETE, OPTIONS)
+    allow_headers=["*"],  # Permite orice header (Authorization, Content-Type, etc.)
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
