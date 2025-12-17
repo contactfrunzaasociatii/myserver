@@ -5,10 +5,15 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import base64
 import math
+import uuid
+from io import BytesIO
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
-# --- NOU: IMPORT RESEND ---
+# --- NOU: IMPORT PENTRU IMAGINI ---
+from PIL import Image  # pip install Pillow
+
+# --- IMPORT RESEND ---
 import resend
 
 # FastAPI Imports
@@ -58,16 +63,24 @@ CPANEL_PORT = int(os.getenv("CPANEL_PORT", 21))
 CPANEL_USER = os.getenv("CPANEL_USERNAME")
 CPANEL_PASSWORD = os.getenv("CPANEL_PASSWORD")
 
+# Căi pentru articole HTML
 ARTICLES_UPLOAD_PATH_FTP = os.getenv("ARTICLES_UPLOAD_PATH_FTP", "/public_html/noutati")
-SITEMAP_UPLOAD_PATH_FTP = os.getenv("SITEMAP_UPLOAD_PATH_FTP", "/public_html")
 ARTICLES_URL_SUBDIR = os.getenv("ARTICLES_URL_SUBDIR", "noutati")
+
+# Căi pentru SITEMAP
+SITEMAP_UPLOAD_PATH_FTP = os.getenv("SITEMAP_UPLOAD_PATH_FTP", "/public_html")
+
+# Căi pentru IMAGINI (Uploads)
+# Implicit: /public_html/uploads -> https://site.ro/uploads
+IMAGES_UPLOAD_PATH_FTP = os.getenv("IMAGES_UPLOAD_PATH_FTP", "/public_html/uploads")
+IMAGES_PUBLIC_URL = os.getenv("IMAGES_PUBLIC_URL", "https://frunza-asociatii.ro/uploads")
+
 SITE_URL = os.getenv("SITE_URL", "https://frunza-asociatii.ro")
 
 # --- EMAIL CONFIG (RESEND) ---
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 
-# Inițializare Resend
 if RESEND_API_KEY:
     resend.api_key = RESEND_API_KEY
 
@@ -88,7 +101,6 @@ env = Environment(loader=FileSystemLoader("templates"))
 
 # ==================== 2. MODELE (DB & Validare) ====================
 
-# Model DB - Articole
 class ArticleDB(Base):
     __tablename__ = "articles"
 
@@ -114,7 +126,7 @@ class ArticleDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Caută clasa ArticleListItem și adaugă linia cu status
+
 class ArticleListItem(BaseModel):
     id: int
     title: str
@@ -125,9 +137,9 @@ class ArticleListItem(BaseModel):
     author: str
     created_at: datetime
     published_at: Optional[datetime]
-    status: str  # <--- ADOUGĂ ACEASTĂ LINIE
+    status: str
 
-# Model Validare - Contact
+
 class ContactForm(BaseModel):
     name: str
     email: EmailStr
@@ -144,13 +156,9 @@ def get_db():
         db.close()
 
 
-# ==================== 3. EMAIL UTILS (RESEND API) ====================
+# ==================== 3. EMAIL UTILS (RESEND) ====================
 
 def send_email(form_data: ContactForm):
-    """
-    Trimite email folosind Resend API (HTTP).
-    Folosește domeniul verificat pentru livrabilitate maximă.
-    """
     try:
         if not RESEND_API_KEY:
             logger.error("Lipseste RESEND_API_KEY din variabilele de mediu")
@@ -177,22 +185,13 @@ def send_email(form_data: ContactForm):
         </html>
         """
 
-        # --- MODIFICAREA ESTE AICI ---
-        # 1. Asigură-te că domeniul 'frunza-asociatii.ro' are statusul "Verified" în Resend Dashboard -> Domains.
-        # 2. Folosește o adresă de pe domeniul tău (ex: contact@, notificari@, no-reply@).
         sender_email = "contact@frunza-asociatii.ro"
 
         params = {
-            # "from": Aici serverele văd că expeditorul este legitim (domeniul tău)
             "from": f"Formular Site <{sender_email}>",
-
-            # "to": Aici primești tu notificarea (probabil tot pe contact@ sau pe adresa ta personală)
             "to": [EMAIL_RECEIVER],
-
             "subject": f"[Contact Site] {form_data.subject}",
             "html": html_body,
-
-            # "reply_to": CRUCIAL - Când dai "Reply" în Outlook/Gmail, răspunsul se duce la client
             "reply_to": form_data.email
         }
 
@@ -237,7 +236,7 @@ def upload_file_ftp(local_path: str, remote_filename: str, remote_dir: str):
     finally:
         if ftp:
             try:
-                ftp.quit();
+                ftp.quit()
             except:
                 pass
 
@@ -254,7 +253,7 @@ def delete_file_ftp(remote_filename: str, remote_dir: str):
     finally:
         if ftp:
             try:
-                ftp.quit();
+                ftp.quit()
             except:
                 pass
 
@@ -272,7 +271,7 @@ def download_from_cpanel(remote_filename: str, local_path: str, remote_dir: str)
     finally:
         if ftp:
             try:
-                ftp.quit();
+                ftp.quit()
             except:
                 pass
 
@@ -434,7 +433,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Permite oricui (Pentru dev/Railway)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -460,7 +459,70 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     raise HTTPException(status_code=400, detail="Invalid credentials")
 
 
-# --- CONTACT FORM (RESEND) ---
+# --- UPLOAD IMAGES TO CPANEL (OPTIMIZED) ---
+@app.post("/upload")
+async def upload_image(
+        file: UploadFile = File(...),
+        token: str = Depends(oauth2_scheme)
+):
+    """
+    Urcă imagini direct pe hosting (cPanel/Cyberfolks) în /uploads.
+    Include optimizare (resize/compress) cu Pillow.
+    """
+    verify_jwt_token(token)
+
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Fișierul trebuie să fie o imagine.")
+
+    try:
+        # 1. Generare nume unic
+        file_ext = file.filename.split(".")[-1].lower()
+        unique_filename = f"{uuid.uuid4()}.{file_ext}"
+
+        # 2. Procesare Imagine (Optimizare)
+        file_content = await file.read()
+        image = Image.open(BytesIO(file_content))
+        output_io = BytesIO()
+
+        # Compresie smart
+        if file_ext in ['jpg', 'jpeg', 'png', 'webp']:
+            if image.mode in ("RGBA", "P"): image = image.convert("RGB")
+            save_format = 'JPEG' if file_ext in ['jpg', 'jpeg'] else file_ext.upper()
+            # Optimizare: Calitate 85% reduce drastic dimensiunea fără a pierde vizual
+            image.save(output_io, format=save_format, quality=85, optimize=True)
+        else:
+            # SVG/GIF trec direct
+            output_io.write(file_content)
+
+        output_io.seek(0)
+
+        # 3. Upload FTP
+        ftp = get_ftp_connection()
+        try:
+            # Verificăm dacă există folderul, dacă nu îl creăm
+            try:
+                ftp.cwd(IMAGES_UPLOAD_PATH_FTP)
+            except error_perm:
+                ftp.mkd(IMAGES_UPLOAD_PATH_FTP)
+                ftp.cwd(IMAGES_UPLOAD_PATH_FTP)
+
+            ftp.storbinary(f'STOR {unique_filename}', output_io)
+        finally:
+            try:
+                ftp.quit()
+            except:
+                pass
+
+        # 4. Return URL Public
+        public_url = f"{IMAGES_PUBLIC_URL}/{unique_filename}"
+        return {"status": "success", "location": public_url}
+
+    except Exception as e:
+        logger.error(f"Upload Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Eroare la upload: {str(e)}")
+
+
+# --- CONTACT FORM ---
 @app.post("/contact")
 async def submit_contact(form: ContactForm):
     success = send_email(form)
@@ -500,12 +562,12 @@ async def create_article(payload: dict = Body(...), token: str = Depends(oauth2_
 
 @app.get("/articles")
 def get_articles(
-    page: int = 1,
-    limit: int = 6,
-    db: Session = Depends(get_db)
+        page: int = 1,
+        limit: int = 6,
+        db: Session = Depends(get_db)
 ):
+    # Optimizare: Selectăm doar câmpurile necesare pentru listă (fără 'content')
     base_query = db.query(ArticleDB)
-
     total = base_query.with_entities(func.count()).scalar()
 
     rows = (
@@ -519,7 +581,7 @@ def get_articles(
             ArticleDB.slug,
             ArticleDB.category,
             ArticleDB.excerpt,
-            ArticleDB.cover_image,
+            ArticleDB.cover_image,  # Acesta va fi URL-ul scurt către imagine
             ArticleDB.author,
             ArticleDB.created_at,
             ArticleDB.published_at,
@@ -528,9 +590,7 @@ def get_articles(
         .all()
     )
 
-    articles = [
-        ArticleListItem(**dict(r._mapping)) for r in rows
-    ]
+    articles = [ArticleListItem(**dict(r._mapping)) for r in rows]
 
     return {
         "status": "success",
@@ -542,8 +602,6 @@ def get_articles(
             "total_pages": math.ceil(total / limit)
         }
     }
-
-
 
 
 @app.get("/articles/{article_id}")
@@ -559,9 +617,9 @@ def get_article_by_slug(slug: str, db: Session = Depends(get_db)):
         ArticleDB.slug == slug,
         ArticleDB.status == "Published"
     ).first()
-    if not article:
-        raise HTTPException(status_code=404)
+    if not article: raise HTTPException(status_code=404)
     return article
+
 
 @app.put("/articles/{article_id}")
 async def update_article(article_id: int, payload: dict = Body(...), token: str = Depends(oauth2_scheme),
@@ -595,7 +653,6 @@ async def update_article(article_id: int, payload: dict = Body(...), token: str 
     db.commit()
     db.refresh(article)
 
-    # State Machine Update
     if old_status == "Published" and new_status == "Draft":
         unpublish_content_pipeline(old_slug)
     elif old_status == "Published" and new_status == "Published" and old_slug != new_slug:
